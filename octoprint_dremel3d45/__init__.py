@@ -372,7 +372,7 @@ if _OCTOPRINT_AVAILABLE:
             """
             # Always show the port - if IP is not configured, user will see
             # an error when they try to connect (handled in virtual_serial_factory)
-            _LOGGER.debug("Advertising port %s in connection dropdown", DREMEL_PORT_NAME)
+            _LOGGER.info("get_additional_port_names hook called - returning [%s]", DREMEL_PORT_NAME)
             return [DREMEL_PORT_NAME]
 
         # -------------------------------------------------------------------------
@@ -446,3 +446,8 @@ def __plugin_load__():
         # SD card upload hook
         "octoprint.printer.sdcardupload": plugin.sdcard_upload_hook,
     }
+
+    _LOGGER.info(
+        "Plugin hooks registered: %s",
+        list(__plugin_hooks__.keys()),
+    )
