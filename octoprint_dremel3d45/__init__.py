@@ -341,7 +341,14 @@ if _OCTOPRINT_AVAILABLE:
                 port, baudrate, read_timeout,
             )
 
-            if not self._settings.get(["printer_ip"]):
+            # Debug: log what settings we can see
+            printer_ip = self._settings.get(["printer_ip"])
+            _LOGGER.info(
+                "Settings check: printer_ip=%r, _settings type=%s",
+                printer_ip, type(self._settings).__name__,
+            )
+
+            if not printer_ip:
                 _LOGGER.error(
                     "Cannot connect to %s: No printer IP configured", DREMEL_PORT_NAME
                 )
@@ -349,7 +356,7 @@ if _OCTOPRINT_AVAILABLE:
 
             _LOGGER.info(
                 "Creating Dremel virtual serial connection to %s",
-                self._settings.get(["printer_ip"]),
+                printer_ip,
             )
 
             from .virtual_serial import DremelVirtualSerial
