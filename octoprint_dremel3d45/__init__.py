@@ -430,13 +430,9 @@ if octoprint_plugin is not None:
             __plugin_implementation__.virtual_serial_factory,
             1,  # Priority: run before default serial factory
         ),
-        "octoprint.comm.transport.serial.additional_port_names": (
-            __plugin_implementation__.get_additional_port_names,
-        ),
+        "octoprint.comm.transport.serial.additional_port_names": __plugin_implementation__.get_additional_port_names,
         # SD card upload hook
-        "octoprint.printer.sdcardupload": (
-            __plugin_implementation__.sdcard_upload_hook,
-        ),
+        "octoprint.printer.sdcardupload": __plugin_implementation__.sdcard_upload_hook,
     }
 
 else:
