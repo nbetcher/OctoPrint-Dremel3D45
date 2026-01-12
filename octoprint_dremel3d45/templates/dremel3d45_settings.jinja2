@@ -1,0 +1,177 @@
+<div id="settings_plugin_dremel3d45">
+    <h4>Dremel 3D45 Connection</h4>
+    
+    <form class="form-horizontal">
+        <div class="control-group">
+            <label class="control-label" for="settings-dremel3d45-printer_ip">
+                Printer IP Address
+            </label>
+            <div class="controls">
+                <input type="text" 
+                       id="settings-dremel3d45-printer_ip"
+                       class="input-block-level"
+                       data-bind="value: settings.plugins.dremel3d45.printer_ip"
+                       placeholder="e.g., 192.168.1.50">
+                <span class="help-block">
+                    IP address of your Dremel 3D45 printer on the local network.
+                </span>
+            </div>
+        </div>
+        
+        <div class="control-group">
+            <label class="control-label" for="settings-dremel3d45-request_timeout">
+                Request Timeout (seconds)
+            </label>
+            <div class="controls">
+                <input type="number" 
+                       id="settings-dremel3d45-request_timeout"
+                       class="input-mini"
+                       data-bind="value: settings.plugins.dremel3d45.request_timeout"
+                       min="5"
+                       max="120">
+                <span class="help-block">
+                    HTTP request timeout in seconds. Default: 30
+                </span>
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label class="control-label" for="settings-dremel3d45-poll_interval">
+                Poll Interval (seconds)
+            </label>
+            <div class="controls">
+                <input type="number" 
+                       id="settings-dremel3d45-poll_interval"
+                       class="input-mini"
+                       data-bind="value: settings.plugins.dremel3d45.poll_interval"
+                       min="2"
+                       max="120">
+                <span class="help-block">
+                    Status update interval. Default: 10
+                </span>
+            </div>
+        </div>
+    </form>
+    
+    <h4>Camera Settings</h4>
+    
+    <form class="form-horizontal">
+        <div class="control-group">
+            <label class="control-label" for="settings-dremel3d45-camera_enabled">
+                Enable Camera
+            </label>
+            <div class="controls">
+                <input type="checkbox" 
+                       id="settings-dremel3d45-camera_enabled"
+                       data-bind="checked: settings.plugins.dremel3d45.camera_enabled">
+                <span class="help-block">
+                    Enable webcam integration. Only available on Dremel 3D45.
+                </span>
+            </div>
+        </div>
+
+        <div class="control-group" data-bind="visible: settings.plugins.dremel3d45.camera_enabled">
+            <label class="control-label" for="settings-dremel3d45-camera_update_global">
+                Update Global Webcam
+            </label>
+            <div class="controls">
+                <input type="checkbox" 
+                       id="settings-dremel3d45-camera_update_global"
+                       data-bind="checked: settings.plugins.dremel3d45.camera_update_global">
+                <span class="help-block">
+                    If enabled, updates OctoPrint's global webcam settings to point at the Dremel camera.
+                    Leave disabled if you already have a webcam configured or use multiple webcams.
+                </span>
+            </div>
+        </div>
+        
+        <div class="control-group" data-bind="visible: settings.plugins.dremel3d45.camera_enabled">
+            <label class="control-label" for="settings-dremel3d45-camera_stream_url">
+                Stream URL
+            </label>
+            <div class="controls">
+                <input type="text" 
+                       id="settings-dremel3d45-camera_stream_url"
+                       class="input-block-level"
+                       data-bind="value: settings.plugins.dremel3d45.camera_stream_url"
+                       placeholder="Leave empty for default (http://PRINTER_IP:10123/?action=stream)">
+                <span class="help-block">
+                    MJPEG stream URL. Leave empty to use printer's built-in camera.
+                </span>
+            </div>
+        </div>
+        
+        <div class="control-group" data-bind="visible: settings.plugins.dremel3d45.camera_enabled">
+            <label class="control-label" for="settings-dremel3d45-camera_snapshot_url">
+                Snapshot URL
+            </label>
+            <div class="controls">
+                <input type="text" 
+                       id="settings-dremel3d45-camera_snapshot_url"
+                       class="input-block-level"
+                       data-bind="value: settings.plugins.dremel3d45.camera_snapshot_url"
+                       placeholder="Leave empty for default (http://PRINTER_IP:10123/?action=snapshot)">
+                <span class="help-block">
+                    Snapshot URL for still images. Leave empty to use printer's built-in camera.
+                </span>
+            </div>
+        </div>
+    </form>
+    
+    <div class="alert alert-info">
+        <strong>Connection Instructions:</strong>
+        <ol>
+            <li>Enter your Dremel 3D45's IP address above and save settings.</li>
+            <li>Go to the Connection panel and select <strong>DREMEL3D45</strong> from the Serial Port dropdown.</li>
+            <li>Click Connect.</li>
+        </ol>
+        <p>
+            <strong>Note:</strong> This plugin communicates with your printer over the local network.
+            No USB cable is required.
+        </p>
+    </div>
+    
+    <div class="alert alert-warning">
+        <strong>Security Notice:</strong>
+        The Dremel 3D45's network interface has no authentication. 
+        Only use this on a trusted local network.
+    </div>
+
+    <h4>SD Index</h4>
+
+    <div class="alert alert-info">
+        This plugin maintains an SD index mapping of uploaded filenames to the printer's internal upload names.
+        The Dremel API does not provide a reliable directory listing, so this mapping is how commands like <strong>M20/M23/M32</strong> work.
+    </div>
+
+    <div class="form-horizontal">
+        <div class="control-group">
+            <label class="control-label">Status</label>
+            <div class="controls">
+                <span data-bind="text: sdIndexConnected() ? 'Connected' : 'Not connected'"></span>
+                <span class="help-block">
+                    SD index entries: <span data-bind="text: sdIndexCount"></span>
+                </span>
+                <button type="button" class="btn" data-bind="click: refreshSdIndex">Refresh</button>
+                <button type="button" class="btn btn-danger" data-bind="click: clearSdIndex">Clear Index</button>
+            </div>
+        </div>
+    </div>
+
+    <table class="table table-condensed" data-bind="visible: sdIndexItems().length > 0">
+        <thead>
+            <tr>
+                <th>Display Name</th>
+                <th>Printer Upload Name</th>
+                <th>Size (bytes)</th>
+            </tr>
+        </thead>
+        <tbody data-bind="foreach: sdIndexItems">
+            <tr>
+                <td data-bind="text: display"></td>
+                <td data-bind="text: remote"></td>
+                <td data-bind="text: size"></td>
+            </tr>
+        </tbody>
+    </table>
+</div>
