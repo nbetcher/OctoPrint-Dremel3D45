@@ -327,11 +327,16 @@ if _OCTOPRINT_AVAILABLE:
             Called when OctoPrint tries to open a serial connection.
             If port is DREMEL3D45, return our virtual serial object.
             """
+            _LOGGER.info(
+                "virtual_serial_factory hook called for port=%s (looking for %s)",
+                port, DREMEL_PORT_NAME,
+            )
+
             if port != DREMEL_PORT_NAME:
-                _LOGGER.debug("Serial factory called for port %s - not our port", port)
+                _LOGGER.info("Serial factory: port %s is not our port, returning None", port)
                 return None
 
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Serial factory called for %s (baudrate=%s, timeout=%s)",
                 port, baudrate, read_timeout,
             )
