@@ -370,12 +370,10 @@ if _OCTOPRINT_AVAILABLE:
 
             Called to get additional port names to show in the connection dropdown.
             """
-            # Only show the port if we have a printer IP configured
-            if self._settings.get(["printer_ip"]):
-                _LOGGER.debug("Advertising port %s in connection dropdown", DREMEL_PORT_NAME)
-                return [DREMEL_PORT_NAME]
-            _LOGGER.debug("Not advertising port (no printer IP configured)")
-            return []
+            # Always show the port - if IP is not configured, user will see
+            # an error when they try to connect (handled in virtual_serial_factory)
+            _LOGGER.debug("Advertising port %s in connection dropdown", DREMEL_PORT_NAME)
+            return [DREMEL_PORT_NAME]
 
         # -------------------------------------------------------------------------
         # SD Card Upload Hook
