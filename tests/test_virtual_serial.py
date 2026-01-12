@@ -202,84 +202,48 @@ class TestGCodeHandlers(unittest.TestCase):
         self.assertEqual(self.serial._selected_file_display, "")
 
     # -------------------------------------------------------------------------
-    # Position Commands
+    # Motion Commands (all no-ops - Dremel doesn't support motion control)
     # -------------------------------------------------------------------------
 
-    def test_m114_reports_position(self):
-        """M114 should report current position."""
-        self.serial._position = {"X": 100.0, "Y": 150.0, "Z": 25.5, "E": 300.0}
-
+    def test_m114_reports_zero_position(self):
+        """M114 should report zeros (position not tracked)."""
         responses = self._send_command("M114")
 
         response_text = " ".join(responses)
-        self.assertIn("X:100.00", response_text)
-        self.assertIn("Y:150.00", response_text)
-        self.assertIn("Z:25.50", response_text)
+        self.assertIn("X:0.00", response_text)
+        self.assertIn("Y:0.00", response_text)
+        self.assertIn("Z:0.00", response_text)
         self.assertIn("ok", responses)
 
-    def test_g0_updates_position_absolute(self):
-        """G0 should update simulated position in absolute mode."""
-        self.serial._relative_positioning = False
-        self.serial._position = {"X": 0, "Y": 0, "Z": 0, "E": 0}
-
+    def test_g0_acknowledged(self):
+        """G0 should be acknowledged (no-op)."""
         responses = self._send_command("G0 X50 Y100 Z10")
-
         self.assertIn("ok", responses)
-        self.assertEqual(self.serial._position["X"], 50.0)
-        self.assertEqual(self.serial._position["Y"], 100.0)
-        self.assertEqual(self.serial._position["Z"], 10.0)
 
-    def test_g1_updates_position_relative(self):
-        """G1 should update simulated position in relative mode."""
-        self.serial._relative_positioning = True
-        self.serial._position = {"X": 100, "Y": 100, "Z": 10, "E": 0}
-
-        responses = self._send_command("G1 X-10 Y20")
-
+    def test_g1_acknowledged(self):
+        """G1 should be acknowledged (no-op)."""
+        responses = self._send_command("G1 X-10 Y20 E5")
         self.assertIn("ok", responses)
-        self.assertEqual(self.serial._position["X"], 90.0)
-        self.assertEqual(self.serial._position["Y"], 120.0)
 
-    def test_g90_sets_absolute(self):
-        """G90 should set absolute positioning mode."""
-        self.serial._relative_positioning = True
-
+    def test_g90_acknowledged(self):
+        """G90 should be acknowledged (no-op)."""
         responses = self._send_command("G90")
-
         self.assertIn("ok", responses)
-        self.assertFalse(self.serial._relative_positioning)
 
-    def test_g91_sets_relative(self):
-        """G91 should set relative positioning mode."""
-        self.serial._relative_positioning = False
-
+    def test_g91_acknowledged(self):
+        """G91 should be acknowledged (no-op)."""
         responses = self._send_command("G91")
-
         self.assertIn("ok", responses)
-        self.assertTrue(self.serial._relative_positioning)
 
-    def test_g28_homes_position(self):
-        """G28 should reset position to origin."""
-        self.serial._position = {"X": 100, "Y": 100, "Z": 50, "E": 200}
-
+    def test_g28_acknowledged(self):
+        """G28 should be acknowledged (no-op)."""
         responses = self._send_command("G28")
-
         self.assertIn("ok", responses)
-        self.assertEqual(self.serial._position["X"], 0.0)
-        self.assertEqual(self.serial._position["Y"], 0.0)
-        self.assertEqual(self.serial._position["Z"], 0.0)
-        # E should not be reset by G28
-        self.assertEqual(self.serial._position["E"], 200.0)
 
-    def test_g92_sets_position(self):
-        """G92 should set current position."""
-        self.serial._position = {"X": 0, "Y": 0, "Z": 0, "E": 0}
-
+    def test_g92_acknowledged(self):
+        """G92 should be acknowledged (no-op)."""
         responses = self._send_command("G92 X100 E0")
-
         self.assertIn("ok", responses)
-        self.assertEqual(self.serial._position["X"], 100.0)
-        self.assertEqual(self.serial._position["E"], 0.0)
 
     # -------------------------------------------------------------------------
     # Firmware / Info Commands
@@ -337,23 +301,14 @@ class TestGCodeHandlers(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_semicolon_comments_stripped(self):
-        """Semicolon comments should be stripped."""
-        self.serial._position = {"X": 0, "Y": 0, "Z": 0, "E": 0}
-
+        """Semicolon comments should be stripped and command acknowledged."""
         responses = self._send_command("G0 X100 ; move to X=100")
-
         self.assertIn("ok", responses)
-        self.assertEqual(self.serial._position["X"], 100.0)
 
     def test_paren_comments_stripped(self):
-        """Parenthetical comments should be stripped."""
-        self.serial._position = {"X": 0, "Y": 0, "Z": 0, "E": 0}
-
+        """Parenthetical comments should be stripped and command acknowledged."""
         responses = self._send_command("G0 X50 (this is a comment) Y75")
-
         self.assertIn("ok", responses)
-        self.assertEqual(self.serial._position["X"], 50.0)
-        self.assertEqual(self.serial._position["Y"], 75.0)
 
     # -------------------------------------------------------------------------
     # Serial Interface

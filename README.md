@@ -11,22 +11,23 @@ The Dremel 3D45 printer has no USB-serial support—all communication happens ov
 ### Core Functionality
 - **Virtual serial port** - Shows as "DREMEL3D45" in OctoPrint's connection dropdown
 - **Temperature monitoring** - Real-time extruder, bed, and chamber temperatures
-- **Temperature control** - Set nozzle and bed temperatures via M104/M140/M109/M190
+- **Temperature control** - Set nozzle and bed temperatures via M104/M140/M109/M190 (blocked during active printing)
 - **Print control** - Start, pause, resume, and cancel prints
 - **Progress tracking** - Print progress, elapsed time, remaining time, current layer
 - **File upload** - Upload GCode files to the printer via OctoPrint's interface
 - **Webcam integration** - Use the Dremel's built-in camera in OctoPrint
 
-### Supported GCode Commands (58 total)
+### GCode Command Categories
 
-| Category | Commands |
-|----------|----------|
-| Temperature | M104, M105, M109, M140, M155, M190 |
-| Print Control | M20, M21, M22, M23, M24, M25, M26, M27, M32, M524 |
-| Information | M31, M73, M75, M76, M77, M114, M115, M117, M118, M119, M532 |
-| Motion (simulated) | G0, G1, G4, G28, G90, G91, G92 |
-| Configuration | M82, M83, M106, M107, M110, M220, M221, M400 |
-| Miscellaneous | M0, M1, M17, M18, M84, M108, M112, M211, M500-M503, M600, M999, T0, T1 |
+| Category | Commands | Notes |
+|----------|----------|-------|
+| **Temperature (read)** | M105 | Query current/target temps |
+| **Temperature (write)** | M104, M109, M140, M155, M190 | Set temps via REST API; **blocked during active printing** (allowed when paused) |
+| **Print Control** | M23, M24, M25, M27, M524 | Start/pause/resume/cancel; M24 resumes when paused |
+| **Information** | M31, M73, M75-M77, M114, M115, M117-M119, M532 | Query status, progress, layer |
+| **Motion** | G0, G1, G4, G10, G11, G28, G29, G90-G92 | **Acknowledged only** - Dremel doesn't support motion control via GCode |
+| **Configuration** | M82, M83, M92, M106, M107, M110, M201-M205, M220, M221, M301, M304, M400-M420, M500-M503, M851 | Acknowledged for compatibility |
+| **Miscellaneous** | M0, M1, M17, M18, M84, M108, M112, M211, M600, M862, M999, T0, T1 | Various no-ops and pause triggers |
 
 ## Installation
 
@@ -89,11 +90,12 @@ Due to the Dremel 3D45's REST API design:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Motion control | ❌ Simulated | G0/G1/G28 are tracked locally but not sent to printer |
-| Fan control | ❌ No-op | Dremel API doesn't support M106/M107 |
-| Real-time temp control during prints | ⚠️ Limited | Temps set during a print may be overridden by the print file |
-| SD file listing | ⚠️ Session-scoped | Plugin tracks files uploaded via OctoPrint |
-| Streaming GCode | ❌ Not supported | Printer only runs pre-uploaded files |
+| **Motion control** | ❌ Not supported | G0/G1/G28 are acknowledged but ignored—Dremel handles motion internally |
+| **Position tracking** | ❌ Not available | M114 reports 0,0,0,0 (layer number available during prints) |
+| **Fan control** | ❌ No-op | Dremel API doesn't support M106/M107 |
+| **Temperature control during printing** | ⚠️ Blocked | M104/M140 blocked during active print (allowed when paused) |
+| **SD file listing** | ⚠️ Session-scoped | Plugin tracks files uploaded via OctoPrint only |
+| **Streaming GCode** | ❌ Not supported | Printer only runs pre-uploaded files |
 
 ## SD Index
 

@@ -121,13 +121,6 @@ class DremelVirtualSerial:
         self._door_open = False  # Door sensor state
         self._fan_speed = 0  # Fan speed (read-only, can't control)
 
-        # Position tracking (simulated for non-moving commands)
-        self._position = {"X": 0.0, "Y": 0.0, "Z": 0.0, "E": 0.0}
-
-        # GCode modality tracking (for simulated position math)
-        self._relative_positioning = False
-        self._relative_extrusion = False
-
         # Auto-reporting controls (Marlin-style)
         self._autotemp_enabled = False
         self._autotemp_interval = 0
@@ -601,16 +594,16 @@ class DremelVirtualSerial:
         self._send("ok")
 
     def _gcode_M114(self, command: str) -> None:
-        """Report current position (simulated, with layer from API)."""
-        # During a print, report the actual layer from the Dremel API
+        """Report current position.
+        
+        Note: Position is not tracked - Dremel doesn't support motion control.
+        During printing, we report the current layer from the API.
+        """
         if self._printing or self._paused:
-            self._send(
-                f"X:{self._position['X']:.2f} Y:{self._position['Y']:.2f} Z:{self._position['Z']:.2f} E:{self._position['E']:.2f} Layer:{self._current_layer}"
-            )
+            # Only layer info is available from the Dremel API
+            self._send(f"X:0.00 Y:0.00 Z:0.00 E:0.00 Layer:{self._current_layer}")
         else:
-            self._send(
-                f"X:{self._position['X']:.2f} Y:{self._position['Y']:.2f} Z:{self._position['Z']:.2f} E:{self._position['E']:.2f}"
-            )
+            self._send("X:0.00 Y:0.00 Z:0.00 E:0.00")
         self._send("ok")
 
     def _gcode_M119(self, command: str) -> None:
@@ -930,43 +923,32 @@ class DremelVirtualSerial:
         self._send("ok")
 
     def _gcode_G90(self, command: str) -> None:
-        """Set to Absolute Positioning."""
-        self._relative_positioning = False
+        """Set to Absolute Positioning (no-op - motion not supported)."""
         self._send("ok")
 
     def _gcode_G91(self, command: str) -> None:
-        """Set to Relative Positioning."""
-        self._relative_positioning = True
+        """Set to Relative Positioning (no-op - motion not supported)."""
         self._send("ok")
 
     def _gcode_M82(self, command: str) -> None:
-        """Set Extruder to Absolute Positioning."""
-        self._relative_extrusion = False
+        """Set Extruder to Absolute Positioning (no-op - motion not supported)."""
         self._send("ok")
 
     def _gcode_M83(self, command: str) -> None:
-        """Set Extruder to Relative Positioning."""
-        self._relative_extrusion = True
+        """Set Extruder to Relative Positioning (no-op - motion not supported)."""
         self._send("ok")
 
     def _gcode_G28(self, command: str) -> None:
-        """Home axes (simulated - we can't actually control motion)."""
-        if self._is_print_active():
-            self._send("Error: Cannot home while printing")
-            self._send("ok")
-            return
-
-        self._position = {"X": 0.0, "Y": 0.0, "Z": 0.0, "E": self._position["E"]}
+        """Home axes (no-op - Dremel doesn't support motion control via GCode)."""
+        # Dremel handles homing internally; we just acknowledge
         self._send("ok")
 
     def _gcode_G0(self, command: str) -> None:
-        """Rapid move (simulated)."""
-        self._parse_move(command)
+        """Rapid move (no-op - Dremel doesn't support motion control via GCode)."""
         self._send("ok")
 
     def _gcode_G1(self, command: str) -> None:
-        """Linear move (simulated)."""
-        self._parse_move(command)
+        """Linear move (no-op - Dremel doesn't support motion control via GCode)."""
         self._send("ok")
 
     def _gcode_M400(self, command: str) -> None:
@@ -999,8 +981,7 @@ class DremelVirtualSerial:
         self._send("ok")
 
     def _gcode_G92(self, command: str) -> None:
-        """Set current position (simulated)."""
-        self._parse_set_position(command)
+        """Set current position (no-op - position not tracked)."""
         self._send("ok")
 
     def _gcode_G4(self, command: str) -> None:
@@ -1154,14 +1135,11 @@ class DremelVirtualSerial:
         self._send("ok")
 
     def _gcode_G10(self, command: str) -> None:
-        """Firmware retract (simulated)."""
-        # Simulate retraction by adjusting E position
-        self._position["E"] -= 1.0  # Typical retract amount
+        """Firmware retract (no-op - Dremel doesn't support motion control)."""
         self._send("ok")
 
     def _gcode_G11(self, command: str) -> None:
-        """Firmware unretract (simulated)."""
-        self._position["E"] += 1.0
+        """Firmware unretract (no-op - Dremel doesn't support motion control)."""
         self._send("ok")
 
     def _gcode_M92(self, command: str) -> None:
@@ -1197,32 +1175,6 @@ class DremelVirtualSerial:
     def _gcode_M862(self, command: str) -> None:
         """Printer model check (Prusa-style, no-op)."""
         self._send("ok")
-
-    def _parse_move(self, command: str) -> None:
-        """Parse G0/G1 move command and update simulated position."""
-        for axis in ["X", "Y", "Z", "E"]:
-            match = re.search(rf"{axis}([-\d.]+)", command)
-            if not match:
-                continue
-
-            value = float(match.group(1))
-            if axis == "E":
-                if self._relative_extrusion:
-                    self._position[axis] += value
-                else:
-                    self._position[axis] = value
-            else:
-                if self._relative_positioning:
-                    self._position[axis] += value
-                else:
-                    self._position[axis] = value
-
-    def _parse_set_position(self, command: str) -> None:
-        """Parse G92 and set simulated position."""
-        for axis in ["X", "Y", "Z", "E"]:
-            match = re.search(rf"{axis}([-\d.]+)", command)
-            if match:
-                self._position[axis] = float(match.group(1))
 
     # -------------------------------------------------------------------------
     # Dremel API Communication (via dremel3dpy library)
