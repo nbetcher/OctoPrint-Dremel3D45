@@ -61,7 +61,8 @@ if octoprint_plugin is not None:
         # ---------------------------------------------------------------------
 
         def on_startup(self, host: str, port: int) -> None:
-            _LOGGER.info("Dremel 3D45 plugin starting up")
+            _LOGGER.info("Dremel 3D45 plugin starting up (OctoPrint host=%s:%s)", host, port)
+            _LOGGER.debug("Plugin version: %s", __plugin_version__)
 
         def on_after_startup(self) -> None:
             _LOGGER.info("Dremel 3D45 plugin ready")
@@ -72,6 +73,12 @@ if octoprint_plugin is not None:
                 _LOGGER.info(
                     "To connect: Select port '%s' in the connection panel",
                     DREMEL_PORT_NAME,
+                )
+                _LOGGER.debug(
+                    "Settings: timeout=%ss, poll_interval=%ss, camera_enabled=%s",
+                    self._settings.get(["request_timeout"]),
+                    self._settings.get(["poll_interval"]),
+                    self._settings.get_boolean(["camera_enabled"]),
                 )
             else:
                 _LOGGER.warning(
@@ -90,11 +97,14 @@ if octoprint_plugin is not None:
         def on_shutdown(self) -> None:
             _LOGGER.info("Dremel 3D45 plugin shutting down")
             if self._virtual_serial:
+                _LOGGER.debug("Closing active virtual serial connection")
                 try:
                     self._virtual_serial.close()
-                except Exception:
-                    pass
+                    _LOGGER.debug("Virtual serial connection closed successfully")
+                except Exception as e:
+                    _LOGGER.warning("Error closing virtual serial connection: %s", e)
                 self._virtual_serial = None
+            _LOGGER.info("Dremel 3D45 plugin shutdown complete")
 
         # ---------------------------------------------------------------------
         # SettingsPlugin
@@ -125,6 +135,7 @@ if octoprint_plugin is not None:
             }
 
         def on_settings_save(self, data: dict) -> None:
+            _LOGGER.debug("Settings save requested with data keys: %s", list(data.keys()))
             old_ip = self._settings.get(["printer_ip"])
 
             # Let OctoPrint persist settings
@@ -133,6 +144,15 @@ if octoprint_plugin is not None:
             new_ip = self._settings.get(["printer_ip"])
             if old_ip != new_ip:
                 _LOGGER.info("Printer IP changed from %s to %s", old_ip, new_ip)
+                if self._virtual_serial:
+                    _LOGGER.warning(
+                        "Printer IP changed while connected - reconnect required for changes to take effect"
+                    )
+            _LOGGER.debug(
+                "Settings saved: timeout=%ss, poll_interval=%ss",
+                self._settings.get(["request_timeout"]),
+                self._settings.get(["poll_interval"]),
+            )
 
             if self._settings.get_boolean(["camera_enabled"]) and self._settings.get_boolean(
                 ["camera_update_global"]
@@ -143,6 +163,7 @@ if octoprint_plugin is not None:
             """Configure OctoPrint's webcam settings for Dremel camera."""
             printer_ip = self._settings.get(["printer_ip"])
             if not printer_ip:
+                _LOGGER.debug("Cannot configure camera: no printer IP set")
                 return
 
             stream_url = self._settings.get(["camera_stream_url"])
@@ -150,10 +171,12 @@ if octoprint_plugin is not None:
 
             if not stream_url:
                 stream_url = f"http://{printer_ip}:10123/?action=stream"
+                _LOGGER.debug("Using default stream URL: %s", stream_url)
             if not snapshot_url:
                 snapshot_url = f"http://{printer_ip}:10123/?action=snapshot"
+                _LOGGER.debug("Using default snapshot URL: %s", snapshot_url)
 
-            _LOGGER.info("Configuring global webcam settings: stream=%s", stream_url)
+            _LOGGER.info("Configuring global webcam settings: stream=%s, snapshot=%s", stream_url, snapshot_url)
 
             try:
                 from octoprint.settings import settings as octoprint_settings
@@ -163,6 +186,7 @@ if octoprint_plugin is not None:
                 s.set(["webcam", "snapshot"], snapshot_url)
                 s.set(["webcam", "streamRatio"], "4:3")
                 s.save()
+                _LOGGER.info("Global webcam settings updated successfully")
             except Exception as e:
                 _LOGGER.warning("Failed to update global webcam settings: %s", e)
 
@@ -201,6 +225,7 @@ if octoprint_plugin is not None:
 
         def on_api_get(self, request):  # noqa: ANN001
             """Return plugin status information for the settings UI."""
+            _LOGGER.debug("API GET request received")
             from flask import jsonify
 
             sd_index = {"count": 0, "items": []}
@@ -251,17 +276,22 @@ if octoprint_plugin is not None:
             )
 
         def on_api_command(self, command: str, data):  # noqa: ANN001
+            _LOGGER.debug("API command received: %s", command)
             if command != "clear_sd_index":
+                _LOGGER.debug("Unknown API command: %s", command)
                 return
 
             from flask import jsonify
+
+            _LOGGER.info("Clearing SD file index")
 
             # Clear in-memory (if connected) and on-disk mapping
             if self._virtual_serial:
                 try:
                     self._virtual_serial.clear_sd_index()
-                except Exception:
-                    pass
+                    _LOGGER.debug("Cleared in-memory SD index")
+                except Exception as e:
+                    _LOGGER.warning("Failed to clear in-memory SD index: %s", e)
 
             try:
                 import os
@@ -270,9 +300,11 @@ if octoprint_plugin is not None:
                 index_file = os.path.join(data_folder, "sd_index.json")
                 if os.path.exists(index_file):
                     os.remove(index_file)
-            except Exception:
-                pass
+                    _LOGGER.debug("Removed SD index file: %s", index_file)
+            except Exception as e:
+                _LOGGER.warning("Failed to remove SD index file: %s", e)
 
+            _LOGGER.info("SD file index cleared successfully")
             return jsonify(ok=True)
 
         # ---------------------------------------------------------------------
@@ -293,7 +325,13 @@ if octoprint_plugin is not None:
             If port is DREMEL3D45, return our virtual serial object.
             """
             if port != DREMEL_PORT_NAME:
+                _LOGGER.debug("Serial factory called for port %s - not our port", port)
                 return None
+
+            _LOGGER.debug(
+                "Serial factory called for %s (baudrate=%s, timeout=%s)",
+                port, baudrate, read_timeout,
+            )
 
             if not self._settings.get(["printer_ip"]):
                 _LOGGER.error(
@@ -320,6 +358,7 @@ if octoprint_plugin is not None:
                 data_folder=data_folder,
             )
 
+            _LOGGER.info("Virtual serial connection created successfully")
             return self._virtual_serial
 
         def get_additional_port_names(self, *args, **kwargs) -> list:
@@ -330,7 +369,9 @@ if octoprint_plugin is not None:
             """
             # Only show the port if we have a printer IP configured
             if self._settings.get(["printer_ip"]):
+                _LOGGER.debug("Advertising port %s in connection dropdown", DREMEL_PORT_NAME)
                 return [DREMEL_PORT_NAME]
+            _LOGGER.debug("Not advertising port (no printer IP configured)")
             return []
 
         # ---------------------------------------------------------------------
@@ -355,22 +396,26 @@ if octoprint_plugin is not None:
             We intercept this and upload via the Dremel REST API.
             """
             if not self._virtual_serial:
+                _LOGGER.error("SD upload failed: not connected to Dremel printer")
                 sd_upload_failed(
                     filename, path, "Not connected to Dremel printer"
                 )
                 return
 
-            _LOGGER.info("Uploading file to Dremel: %s", filename)
+            _LOGGER.info("Starting SD upload: %s -> %s", path, filename)
+            _LOGGER.debug("Upload source path: %s", path)
             sd_upload_started(filename, path)
 
             try:
                 success = self._virtual_serial.upload_file(path, filename)
                 if success:
+                    _LOGGER.info("SD upload succeeded: %s", filename)
                     sd_upload_succeeded(filename, path)
                 else:
+                    _LOGGER.error("SD upload failed (no exception): %s", filename)
                     sd_upload_failed(filename, path, "Upload failed")
             except Exception as e:
-                _LOGGER.exception("Upload error: %s", e)
+                _LOGGER.exception("SD upload error for %s: %s", filename, e)
                 sd_upload_failed(filename, path, str(e))
 
     # -------------------------------------------------------------------------

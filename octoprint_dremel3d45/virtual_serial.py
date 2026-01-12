@@ -83,11 +83,18 @@ class DremelVirtualSerial:
         self._read_timeout = read_timeout
         self._write_timeout = write_timeout
 
+        _LOGGER.debug(
+            "Initializing DremelVirtualSerial (timeout=%.1fs, write_timeout=%.1fs)",
+            read_timeout, write_timeout,
+        )
+
         self._closed = False
 
         # Get printer settings
         self._host = settings.get(["printer_ip"]) or ""
         self._request_timeout = settings.get_int(["request_timeout"]) or 30
+
+        _LOGGER.debug("Printer host: %s, request timeout: %ds", self._host, self._request_timeout)
 
         # Response queue - OctoPrint reads from here
         self._outgoing: queue.Queue[str] = queue.Queue()
@@ -141,17 +148,23 @@ class DremelVirtualSerial:
         self._poll_stop = threading.Event()
         self._poll_interval = settings.get_int(["poll_interval"]) or 10
 
+        _LOGGER.debug("Poll interval: %ds", self._poll_interval)
+
         # Lock for thread safety
         self._lock = threading.RLock()
 
         # Optional persisted SD index path
         if data_folder:
+            _LOGGER.debug("Data folder provided: %s", data_folder)
             try:
                 os.makedirs(data_folder, exist_ok=True)
                 self._sd_index_path = os.path.join(data_folder, "sd_index.json")
+                _LOGGER.debug("SD index path: %s", self._sd_index_path)
             except Exception as e:
                 _LOGGER.warning("Failed to initialize data folder %r: %s", data_folder, e)
                 self._sd_index_path = None
+        else:
+            _LOGGER.debug("No data folder provided - SD index will not be persisted")
 
         # Load persisted SD index (best-effort)
         self._load_sd_index()
@@ -163,10 +176,14 @@ class DremelVirtualSerial:
         """Load the persisted SD index from disk (best-effort)."""
         path = self._sd_index_path
         if not path:
+            _LOGGER.debug("No SD index path configured - skipping load")
             return
+
+        _LOGGER.debug("Loading SD index from %s", path)
 
         try:
             if not os.path.exists(path):
+                _LOGGER.debug("SD index file does not exist")
                 return
 
             with open(path, "r", encoding="utf-8") as f:
@@ -213,11 +230,16 @@ class DremelVirtualSerial:
         """Persist the SD index to disk (best-effort)."""
         path = self._sd_index_path
         if not path:
+            _LOGGER.debug("No SD index path configured - skipping save")
             return
+
+        _LOGGER.debug("Saving SD index to %s", path)
 
         try:
             with self._lock:
                 items = dict(self._sd_index)
+
+            _LOGGER.debug("Saving %d SD index entries", len(items))
 
             payload = {
                 "schema_version": self._SD_INDEX_SCHEMA_VERSION,
@@ -229,6 +251,7 @@ class DremelVirtualSerial:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, sort_keys=True)
             os.replace(tmp_path, path)
+            _LOGGER.debug("SD index saved successfully")
         except Exception as e:
             _LOGGER.warning("Failed to save sd_index to %s: %s", path, e)
 
@@ -242,6 +265,7 @@ class DremelVirtualSerial:
 
     @timeout.setter
     def timeout(self, value: float) -> None:
+        _LOGGER.debug("Read timeout changed: %.1fs -> %.1fs", self._read_timeout, value)
         self._read_timeout = value
 
     @property
@@ -250,6 +274,7 @@ class DremelVirtualSerial:
 
     @write_timeout.setter
     def write_timeout(self, value: float) -> None:
+        _LOGGER.debug("Write timeout changed: %.1fs -> %.1fs", self._write_timeout, value)
         self._write_timeout = value
 
     @property
@@ -321,13 +346,17 @@ class DremelVirtualSerial:
 
     def reset_input_buffer(self) -> None:
         """Clear queued outgoing responses (pyserial compatibility)."""
+        cleared = 0
         with self._lock:
             while True:
                 try:
                     self._outgoing.get_nowait()
+                    cleared += 1
                 except queue.Empty:
                     break
             self._outgoing_bytes = 0
+        if cleared > 0:
+            _LOGGER.debug("Input buffer reset - cleared %d queued responses", cleared)
 
     def reset_output_buffer(self) -> None:
         """pyserial compatibility (no-op; writes are processed immediately)."""
@@ -373,11 +402,17 @@ class DremelVirtualSerial:
         self._closed = True
         self._poll_stop.set()
         if self._poll_thread and self._poll_thread.is_alive():
+            _LOGGER.debug("Waiting for poll thread to stop...")
             self._poll_thread.join(timeout=5.0)
+            if self._poll_thread.is_alive():
+                _LOGGER.warning("Poll thread did not stop within timeout")
+            else:
+                _LOGGER.debug("Poll thread stopped")
         self._connected = False
         self._printer = None
         self._read_buffer.clear()
         self.reset_input_buffer()
+        _LOGGER.info("Virtual serial connection closed")
 
     # -------------------------------------------------------------------------
     # Startup / Connection
@@ -398,11 +433,14 @@ class DremelVirtualSerial:
 
         # Try to connect to printer using dremel3dpy library
         try:
+            _LOGGER.debug("Creating Dremel3DPrinter instance for host: %s", self._host)
             self._printer = Dremel3DPrinter(self._host)
             self._connected = True
+            _LOGGER.info("Connected to Dremel printer at %s", self._host)
 
             # Get firmware version from library
             firmware = self._printer.get_firmware_version() or "Unknown"
+            _LOGGER.info("Printer firmware version: %s", firmware)
 
             # Send capability report
             self._send(f"FIRMWARE_NAME:Dremel3D45 FIRMWARE_VERSION:{firmware}")
@@ -411,15 +449,18 @@ class DremelVirtualSerial:
             self._send("ok")
 
             # Start polling thread
+            _LOGGER.debug("Starting poll thread (interval=%ds)", self._poll_interval)
             self._poll_thread = threading.Thread(
                 target=self._poll_loop,
                 name="dremel3d45.poll",
                 daemon=True,
             )
             self._poll_thread.start()
+            _LOGGER.debug("Poll thread started")
 
         except Exception as e:
-            _LOGGER.error("Failed to connect to printer: %s", e)
+            _LOGGER.error("Failed to connect to printer at %s: %s", self._host, e)
+            _LOGGER.debug("Connection error details", exc_info=True)
             self._send(f"Error: Connection failed - {e}")
 
     def _send(self, line: str) -> None:
@@ -542,6 +583,7 @@ class DremelVirtualSerial:
         # Dispatch to handler
         handler = getattr(self, f"_gcode_{cmd}", None)
         if handler:
+            _LOGGER.debug("Dispatching command %s to handler", cmd)
             try:
                 handler(command)
             except Exception as e:
@@ -550,7 +592,7 @@ class DremelVirtualSerial:
                 self._send("ok")
         else:
             # Unknown command - just acknowledge
-            _LOGGER.debug("Unknown command: %s", command)
+            _LOGGER.debug("Unknown/unsupported command (acknowledged): %s", command)
             self._send("ok")
 
     # -------------------------------------------------------------------------
@@ -564,6 +606,11 @@ class DremelVirtualSerial:
         bed = self._temps.get("bed", (0, 0))
         chamber = self._temps.get("chamber", (0, 0))
         
+        _LOGGER.debug(
+            "Temperature report: extruder=%.1f/%.1f, bed=%.1f/%.1f, chamber=%.1f",
+            t0[0], t0[1], bed[0], bed[1], chamber[0],
+        )
+        
         # Marlin-ish format: ok T:.. /.. B:.. /.. (extras tolerated)
         self._send(
             f"ok T:{t0[0]:.1f} /{t0[1]:.1f} B:{bed[0]:.1f} /{bed[1]:.1f} C:{chamber[0]:.1f} /{chamber[1]:.1f}"
@@ -572,16 +619,23 @@ class DremelVirtualSerial:
     def _gcode_M115(self, command: str) -> None:
         """Report firmware info."""
         if not self._printer:
+            _LOGGER.warning("M115 requested but not connected")
             self._send("Error: Not connected")
             self._send("ok")
             return
         
         # Refresh printer info
+        _LOGGER.debug("Refreshing printer info for M115")
         self._printer.set_printer_info(refresh=True)
         
         machine = self._printer.get_title() or "Dremel 3D45"
         firmware = self._printer.get_firmware_version() or "Unknown"
         serial = self._printer.get_serial_number() or "Unknown"
+        
+        _LOGGER.debug(
+            "Firmware info: machine=%s, firmware=%s, serial=%s",
+            machine, firmware, serial,
+        )
         
         # Include UUID for plugin compatibility
         self._send(f"FIRMWARE_NAME:Dremel3D45 MACHINE_TYPE:{machine} FIRMWARE_VERSION:{firmware} SERIAL:{serial} UUID:{serial}")
@@ -639,6 +693,8 @@ class DremelVirtualSerial:
         # (self._sd_index) of files we have uploaded ourselves.
         self._fetch_sd_files()
         
+        _LOGGER.debug("M20: Listing %d files in SD index", len(self._sd_files))
+        
         self._send("Begin file list")
         for f in self._sd_files:
             name = f.get("name", "unknown.gcode")
@@ -650,19 +706,23 @@ class DremelVirtualSerial:
     def _gcode_M23(self, command: str) -> None:
         """Select SD file for printing. Format: M23 filename.gcode"""
         if self._is_print_active():
+            _LOGGER.warning("M23: Cannot select file while printing")
             self._send("Error: Cannot select file while printing")
             self._send("ok")
             return
 
         parts = command.split(maxsplit=1)
         if len(parts) < 2:
+            _LOGGER.warning("M23: No file specified")
             self._send("Error: No file specified")
             self._send("ok")
             return
 
         filename = parts[1].strip()
+        _LOGGER.debug("M23: Attempting to select file: %s", filename)
         resolved = self._resolve_sd_filename(filename)
         if not resolved:
+            _LOGGER.warning("M23: File not found in SD index: %s", filename)
             self._send("Error: File not found")
             self._send("ok")
             return
@@ -672,6 +732,11 @@ class DremelVirtualSerial:
         self._selected_file_remote = remote_name
         self._selected_file_size = int(file_size or 0)
 
+        _LOGGER.info(
+            "Selected file: %s (remote=%s, size=%d)",
+            display_name, remote_name, file_size,
+        )
+
         self._send(f"File opened: {display_name} Size: {file_size}")
         self._send("File selected")
         self._send("ok")
@@ -679,18 +744,22 @@ class DremelVirtualSerial:
     def _gcode_M24(self, command: str) -> None:
         """Start/resume SD print."""
         if not self._printer:
+            _LOGGER.warning("M24: Cannot start print - not connected")
             self._send("Error: Not connected")
             self._send("ok")
             return
             
         if self._paused:
             # Resume using library method
+            _LOGGER.info("Resuming paused print")
             self._printer.resume_print()
             self._paused = False
             self._printing = True
+            _LOGGER.debug("Print resumed successfully")
             self._send("ok")
         elif self._is_print_active():
             # Already printing - don't start a new job
+            _LOGGER.warning("M24: Print already in progress")
             self._send("Error: Print already in progress")
             self._send("ok")
         elif self._selected_file_remote:
@@ -698,23 +767,34 @@ class DremelVirtualSerial:
             # NOTE: dremel3dpy does not expose a public method to start a print 
             # from a remote filename (only from local file via upload), so we 
             # use the internal default_request helper and PRINT_COMMAND constant.
+            _LOGGER.info(
+                "Starting print: %s (remote=%s)",
+                self._selected_file_display, self._selected_file_remote,
+            )
             try:
                 default_request(self._host, {PRINT_COMMAND: self._selected_file_remote})
                 self._printing = True
                 self._paused = False
+                _LOGGER.info("Print started successfully")
                 self._send("ok")
             except Exception as e:
+                _LOGGER.error("Failed to start print: %s", e)
                 self._send(f"Error: {e}")
                 self._send("ok")
         else:
+            _LOGGER.warning("M24: No file selected for printing")
             self._send("Error: No file selected")
             self._send("ok")
 
     def _gcode_M25(self, command: str) -> None:
         """Pause SD print."""
         if self._printing and self._printer:
+            _LOGGER.info("Pausing print")
             self._printer.pause_print()
             self._paused = True
+            _LOGGER.debug("Print paused successfully")
+        else:
+            _LOGGER.debug("M25: Not printing - nothing to pause")
         self._send("ok")
 
     def _gcode_M600(self, command: str) -> None:
@@ -738,6 +818,11 @@ class DremelVirtualSerial:
             self._autosd_enabled = interval > 0
             self._autosd_interval = interval
             self._last_autosd_ts = 0.0
+            _LOGGER.debug(
+                "Auto-report SD status %s (interval=%ds)",
+                "enabled" if self._autosd_enabled else "disabled",
+                interval,
+            )
             self._send("ok")
             return
 
@@ -752,7 +837,9 @@ class DremelVirtualSerial:
             else:
                 printed = int(self._progress)
                 self._send(f"SD printing byte {printed}/100")
+            _LOGGER.debug("SD status: progress=%.1f%%, layer=%d", self._progress, self._current_layer)
         else:
+            _LOGGER.debug("SD status: not printing")
             self._send("Not SD printing")
         self._send("ok")
 
@@ -765,13 +852,16 @@ class DremelVirtualSerial:
 
     def _gcode_M524(self, command: str) -> None:
         """Abort SD print (Marlin 2.0+)."""
+        _LOGGER.info("Aborting print (M524)")
         if self._printer:
             self._printer.stop_print()
+            _LOGGER.debug("Stop command sent to printer")
         self._printing = False
         self._paused = False
         self._selected_file_display = ""
         self._selected_file_remote = ""
         self._selected_file_size = 0
+        _LOGGER.info("Print aborted - state reset")
         self._send("ok")
 
     def _gcode_M155(self, command: str) -> None:
@@ -782,6 +872,11 @@ class DremelVirtualSerial:
             self._autotemp_enabled = interval > 0
             self._autotemp_interval = interval
             self._last_autotemp_ts = 0.0
+            _LOGGER.debug(
+                "Auto-report temperature %s (interval=%ds)",
+                "enabled" if self._autotemp_enabled else "disabled",
+                interval,
+            )
         self._send("ok")
 
     def _gcode_M104(self, command: str) -> None:
@@ -793,6 +888,7 @@ class DremelVirtualSerial:
         Blocked during active printing (but allowed when paused).
         """
         if self._is_print_active():
+            _LOGGER.warning("M104: Blocked - cannot change temperature while printing")
             self._send("Error: Cannot change temperature while printing")
             self._send("ok")
             return
@@ -801,16 +897,26 @@ class DremelVirtualSerial:
         if match:
             target = int(float(match.group(1)))
             # Clamp to safe range
+            original_target = target
             target = max(0, min(280, target))
+            if target != original_target:
+                _LOGGER.warning(
+                    "M104: Target %d clamped to safe range (0-280): %d",
+                    original_target, target,
+                )
             
+            _LOGGER.info("Setting extruder temperature to %d°C", target)
             try:
                 if target == 0:
+                    _LOGGER.debug("Sending STOPNOZZLEHEAT command")
                     default_request(self._host, "STOPNOZZLEHEAT")
                 else:
+                    _LOGGER.debug("Sending NOZZLEHEAT=%d command", target)
                     default_request(self._host, f"NOZZLEHEAT={target}")
                 self._temps["tool0"] = (self._temps["tool0"][0], float(target))
+                _LOGGER.debug("Extruder temperature target set successfully")
             except Exception as e:
-                _LOGGER.warning("Failed to set nozzle temperature: %s", e)
+                _LOGGER.error("Failed to set nozzle temperature: %s", e)
         self._send("ok")
 
     def _gcode_M140(self, command: str) -> None:
@@ -822,6 +928,7 @@ class DremelVirtualSerial:
         Blocked during active printing (but allowed when paused).
         """
         if self._is_print_active():
+            _LOGGER.warning("M140: Blocked - cannot change temperature while printing")
             self._send("Error: Cannot change temperature while printing")
             self._send("ok")
             return
@@ -830,16 +937,26 @@ class DremelVirtualSerial:
         if match:
             target = int(float(match.group(1)))
             # Clamp to safe range
+            original_target = target
             target = max(0, min(100, target))
+            if target != original_target:
+                _LOGGER.warning(
+                    "M140: Target %d clamped to safe range (0-100): %d",
+                    original_target, target,
+                )
             
+            _LOGGER.info("Setting bed temperature to %d°C", target)
             try:
                 if target == 0:
+                    _LOGGER.debug("Sending STOPPLATEHEAT command")
                     default_request(self._host, "STOPPLATEHEAT")
                 else:
+                    _LOGGER.debug("Sending PLATEHEAT=%d command", target)
                     default_request(self._host, f"PLATEHEAT={target}")
                 self._temps["bed"] = (self._temps["bed"][0], float(target))
+                _LOGGER.debug("Bed temperature target set successfully")
             except Exception as e:
-                _LOGGER.warning("Failed to set bed temperature: %s", e)
+                _LOGGER.error("Failed to set bed temperature: %s", e)
         self._send("ok")
 
     def _gcode_M109(self, command: str) -> None:
@@ -852,6 +969,7 @@ class DremelVirtualSerial:
         Blocked during active printing (but allowed when paused).
         """
         if self._is_print_active():
+            _LOGGER.warning("M109: Blocked - cannot change temperature while printing")
             self._send("Error: Cannot change temperature while printing")
             self._send("ok")
             return
@@ -862,14 +980,16 @@ class DremelVirtualSerial:
             target = int(float(match.group(1)))
             target = max(0, min(280, target))
             
+            _LOGGER.info("Setting extruder temperature to %d°C (and wait)", target)
             try:
                 if target == 0:
                     default_request(self._host, "STOPNOZZLEHEAT")
                 else:
                     default_request(self._host, f"NOZZLEHEAT={target}")
                 self._temps["tool0"] = (self._temps["tool0"][0], float(target))
+                _LOGGER.debug("Extruder temperature target set - OctoPrint will wait for target")
             except Exception as e:
-                _LOGGER.warning("Failed to set nozzle temperature: %s", e)
+                _LOGGER.error("Failed to set nozzle temperature: %s", e)
         self._send("ok")
 
     def _gcode_M190(self, command: str) -> None:
@@ -880,6 +1000,7 @@ class DremelVirtualSerial:
         Blocked during active printing (but allowed when paused).
         """
         if self._is_print_active():
+            _LOGGER.warning("M190: Blocked - cannot change temperature while printing")
             self._send("Error: Cannot change temperature while printing")
             self._send("ok")
             return
@@ -889,14 +1010,16 @@ class DremelVirtualSerial:
             target = int(float(match.group(1)))
             target = max(0, min(100, target))
             
+            _LOGGER.info("Setting bed temperature to %d°C (and wait)", target)
             try:
                 if target == 0:
                     default_request(self._host, "STOPPLATEHEAT")
                 else:
                     default_request(self._host, f"PLATEHEAT={target}")
                 self._temps["bed"] = (self._temps["bed"][0], float(target))
+                _LOGGER.debug("Bed temperature target set - OctoPrint will wait for target")
             except Exception as e:
-                _LOGGER.warning("Failed to set bed temperature: %s", e)
+                _LOGGER.error("Failed to set bed temperature: %s", e)
         self._send("ok")
 
     def _gcode_M106(self, command: str) -> None:
@@ -913,11 +1036,15 @@ class DremelVirtualSerial:
         match = re.search(r"N(\d+)", command)
         if match:
             try:
-                self._current_line = int(match.group(1))
+                new_line = int(match.group(1))
+                _LOGGER.debug("M110: Setting line number to %d", new_line)
+                self._current_line = new_line
             except Exception:
+                _LOGGER.debug("M110: Resetting line number to 0 (parse error)")
                 self._current_line = 0
         else:
             # M110 without N resets to 0 per Marlin behavior
+            _LOGGER.debug("M110: Resetting line number to 0")
             self._current_line = 0
         self._expected_line = self._current_line + 1
         self._send("ok")
@@ -957,11 +1084,13 @@ class DremelVirtualSerial:
 
     def _gcode_M112(self, command: str) -> None:
         """Emergency stop."""
-        _LOGGER.warning("Emergency stop requested!")
+        _LOGGER.critical("EMERGENCY STOP requested (M112)!")
         if self._printer:
+            _LOGGER.info("Sending stop command to printer")
             self._printer.stop_print()
         self._printing = False
         self._paused = False
+        _LOGGER.info("Emergency stop executed - print state reset")
         self._send("ok")
 
     def _gcode_M503(self, command: str) -> None:
@@ -1011,19 +1140,23 @@ class DremelVirtualSerial:
     def _gcode_M32(self, command: str) -> None:
         """Select and start SD print. Format: M32 <filename>"""
         if self._is_print_active():
+            _LOGGER.warning("M32: Cannot start new print while printing")
             self._send("Error: Cannot start new print while printing")
             self._send("ok")
             return
 
         parts = command.split(maxsplit=1)
         if len(parts) < 2:
+            _LOGGER.warning("M32: No file specified")
             self._send("Error: No file specified")
             self._send("ok")
             return
 
         filename = parts[1].strip()
+        _LOGGER.debug("M32: Attempting to select and start: %s", filename)
         resolved = self._resolve_sd_filename(filename)
         if not resolved:
+            _LOGGER.warning("M32: File not found: %s", filename)
             self._send("Error: File not found")
             return
 
@@ -1031,6 +1164,11 @@ class DremelVirtualSerial:
         self._selected_file_display = display_name
         self._selected_file_remote = remote_name
         self._selected_file_size = int(file_size or 0)
+
+        _LOGGER.info(
+            "M32: Selecting and starting print: %s (remote=%s)",
+            display_name, remote_name,
+        )
 
         # Delegate to M24 which actually starts/resumes the print.
         self._gcode_M24("M24")
@@ -1383,8 +1521,10 @@ class DremelVirtualSerial:
         Returns:
             True if upload succeeded
         """
+        _LOGGER.info("Upload requested: %s -> %s", local_path, remote_name)
+        
         if not self._printer:
-            _LOGGER.error("Cannot upload: not connected")
+            _LOGGER.error("Cannot upload: not connected to printer")
             return False
 
         if self._is_print_active():
@@ -1392,6 +1532,7 @@ class DremelVirtualSerial:
             return False
             
         try:
+            _LOGGER.debug("Reading file content from: %s", local_path)
             # Use the library's start_print_from_file which uploads and starts
             # For upload-only, we'd need to use the internal API
             # The library's _upload_print method accepts file content
@@ -1400,12 +1541,17 @@ class DremelVirtualSerial:
 
             try:
                 file_size = int(os.path.getsize(local_path))
+                _LOGGER.debug("File size: %d bytes", file_size)
             except Exception:
                 file_size = 0
             
             # Use the library's internal upload method
+            _LOGGER.debug("Uploading file content to printer...")
             uploaded_name = self._printer._upload_print(file_content)
-            _LOGGER.info("Uploaded %s to printer as %s", local_path, uploaded_name)
+            _LOGGER.info(
+                "File uploaded successfully: %s -> %s (size=%d bytes)",
+                local_path, uploaded_name, file_size,
+            )
 
             display_name = remote_name or uploaded_name
 
@@ -1415,6 +1561,10 @@ class DremelVirtualSerial:
                     "remote": uploaded_name,
                     "size": file_size,
                 }
+                _LOGGER.debug(
+                    "Added to SD index: display=%s, remote=%s",
+                    display_name, uploaded_name,
+                )
 
                 # Store the uploaded name for later use
                 self._selected_file_display = display_name
@@ -1426,6 +1576,7 @@ class DremelVirtualSerial:
             
         except Exception as e:
             _LOGGER.error("Upload failed: %s", e)
+            _LOGGER.debug("Upload error details", exc_info=True)
             return False
 
     # -------------------------------------------------------------------------
@@ -1434,10 +1585,13 @@ class DremelVirtualSerial:
 
     def clear_sd_index(self) -> None:
         """Clear the persisted SD index (best-effort)."""
+        _LOGGER.info("Clearing SD file index")
         with self._lock:
+            count = len(self._sd_index)
             self._sd_index = {}
             self._sd_files = []
             # Keep current selection intact; it's potentially the active job.
+        _LOGGER.debug("Cleared %d entries from SD index", count)
         self._save_sd_index()
 
     def get_sd_index_snapshot(self) -> dict:
