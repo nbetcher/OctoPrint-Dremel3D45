@@ -18,10 +18,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
+# OctoPrint may not be available during testing
 try:
-    import octoprint.plugin as octoprint_plugin
-except Exception:
-    octoprint_plugin = None
+    import octoprint.plugin
+    _OCTOPRINT_AVAILABLE = True
+except ImportError:
+    _OCTOPRINT_AVAILABLE = False
+    octoprint = None  # type: ignore
 
 if TYPE_CHECKING:
     from octoprint.settings import Settings
@@ -40,15 +43,15 @@ __plugin_url__ = "https://www.nickbetcher.com/projects/octoprint_dremel3d45"
 DREMEL_PORT_NAME = "DREMEL3D45"
 
 
-if octoprint_plugin is not None:
-
+# Define plugin class only if OctoPrint is available
+if _OCTOPRINT_AVAILABLE:
     class Dremel3D45Plugin(
-        octoprint_plugin.StartupPlugin,
-        octoprint_plugin.ShutdownPlugin,
-        octoprint_plugin.SettingsPlugin,
-        octoprint_plugin.SimpleApiPlugin,
-        octoprint_plugin.TemplatePlugin,
-        octoprint_plugin.AssetPlugin,
+        octoprint.plugin.StartupPlugin,
+        octoprint.plugin.ShutdownPlugin,
+        octoprint.plugin.SettingsPlugin,
+        octoprint.plugin.SimpleApiPlugin,
+        octoprint.plugin.TemplatePlugin,
+        octoprint.plugin.AssetPlugin,
     ):
         """OctoPrint plugin for Dremel 3D45 network control."""
 
@@ -56,9 +59,9 @@ if octoprint_plugin is not None:
             super().__init__()
             self._virtual_serial = None
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # StartupPlugin
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def on_startup(self, host: str, port: int) -> None:
             _LOGGER.info("Dremel 3D45 plugin starting up (OctoPrint host=%s:%s)", host, port)
@@ -90,9 +93,9 @@ if octoprint_plugin is not None:
             ):
                 self._configure_camera()
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # ShutdownPlugin
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def on_shutdown(self) -> None:
             _LOGGER.info("Dremel 3D45 plugin shutting down")
@@ -106,9 +109,9 @@ if octoprint_plugin is not None:
                 self._virtual_serial = None
             _LOGGER.info("Dremel 3D45 plugin shutdown complete")
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # SettingsPlugin
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def get_settings_defaults(self) -> dict:
             return {
@@ -139,7 +142,7 @@ if octoprint_plugin is not None:
             old_ip = self._settings.get(["printer_ip"])
 
             # Let OctoPrint persist settings
-            super().on_settings_save(data)
+            octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
 
             new_ip = self._settings.get(["printer_ip"])
             if old_ip != new_ip:
@@ -190,9 +193,9 @@ if octoprint_plugin is not None:
             except Exception as e:
                 _LOGGER.warning("Failed to update global webcam settings: %s", e)
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # TemplatePlugin
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def get_template_configs(self) -> list:
             return [
@@ -204,9 +207,9 @@ if octoprint_plugin is not None:
                 }
             ]
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # AssetPlugin
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def get_assets(self) -> dict:
             return {
@@ -214,9 +217,9 @@ if octoprint_plugin is not None:
                 "css": [],
             }
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # SimpleApiPlugin
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def get_api_commands(self) -> dict:
             return {
@@ -307,9 +310,9 @@ if octoprint_plugin is not None:
             _LOGGER.info("SD file index cleared successfully")
             return jsonify(ok=True)
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # Virtual Serial Factory Hook
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def virtual_serial_factory(
             self,
@@ -374,9 +377,9 @@ if octoprint_plugin is not None:
             _LOGGER.debug("Not advertising port (no printer IP configured)")
             return []
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # SD Card Upload Hook
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         def sdcard_upload_hook(
             self,
@@ -418,24 +421,30 @@ if octoprint_plugin is not None:
                 _LOGGER.exception("SD upload error for %s: %s", filename, e)
                 sd_upload_failed(filename, path, str(e))
 
-    # -------------------------------------------------------------------------
-    # Plugin Registration
-    # -------------------------------------------------------------------------
 
-    __plugin_implementation__ = Dremel3D45Plugin()
+# -----------------------------------------------------------------------------
+# Plugin Registration (using __plugin_load__ pattern like Virtual Printer)
+# -----------------------------------------------------------------------------
+
+def __plugin_load__():
+    global __plugin_implementation__
+    global __plugin_hooks__
+
+    if not _OCTOPRINT_AVAILABLE:
+        __plugin_implementation__ = None
+        __plugin_hooks__ = {}
+        return
+
+    plugin = Dremel3D45Plugin()
+    __plugin_implementation__ = plugin
 
     __plugin_hooks__ = {
-        # Virtual serial transport hooks (the proper way!)
+        # Virtual serial transport hooks
         "octoprint.comm.transport.serial.factory": (
-            __plugin_implementation__.virtual_serial_factory,
+            plugin.virtual_serial_factory,
             1,  # Priority: run before default serial factory
         ),
-        "octoprint.comm.transport.serial.additional_port_names": __plugin_implementation__.get_additional_port_names,
+        "octoprint.comm.transport.serial.additional_port_names": plugin.get_additional_port_names,
         # SD card upload hook
-        "octoprint.printer.sdcardupload": __plugin_implementation__.sdcard_upload_hook,
+        "octoprint.printer.sdcardupload": plugin.sdcard_upload_hook,
     }
-
-else:
-    __plugin_implementation__ = None
-    __plugin_hooks__ = {}
-
