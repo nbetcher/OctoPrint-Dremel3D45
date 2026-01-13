@@ -1,7 +1,7 @@
 /*
  * OctoPrint Dremel 3D45 Plugin JavaScript
  *
- * Minimal JS for settings binding. Knockout.js handles most of the work.
+ * Custom ViewModel for Dremel 3D45 settings panel.
  */
 
 $(function() {
@@ -9,15 +9,8 @@ $(function() {
         var self = this;
 
         self.settingsViewModel = parameters[0];
-        // Expose settings at root level for data-bind compatibility
-        self.settings = self.settingsViewModel.settings;
 
-        // Log settings for debugging
-        console.log("Dremel3D45ViewModel initialized, settings:", self.settings);
-        if (self.settings && self.settings.plugins && self.settings.plugins.dremel3d45) {
-            console.log("Dremel settings:", self.settings.plugins.dremel3d45);
-        }
-
+        // Custom observables for SD index display
         self.sdIndexConnected = ko.observable(false);
         self.sdIndexCount = ko.observable(0);
         self.sdIndexItems = ko.observableArray([]);
@@ -46,10 +39,6 @@ $(function() {
                 .done(function() {
                     self.refreshSdIndex();
                 });
-        };
-
-        self.onBeforeBinding = function() {
-            // Settings are automatically bound via data-bind attributes
         };
 
         self.onSettingsShown = function() {

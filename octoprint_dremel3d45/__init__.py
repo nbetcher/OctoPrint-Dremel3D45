@@ -204,7 +204,7 @@ if _OCTOPRINT_AVAILABLE:
                     "type": "settings",
                     "name": "Dremel 3D45",
                     "template": "dremel3d45_settings.jinja2",
-                    "custom_bindings": True,
+                    "custom_bindings": False,
                 }
             ]
 
