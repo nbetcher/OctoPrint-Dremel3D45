@@ -9,7 +9,14 @@ $(function() {
         var self = this;
 
         self.settingsViewModel = parameters[0];
+        // Expose settings at root level for data-bind compatibility
         self.settings = self.settingsViewModel.settings;
+
+        // Log settings for debugging
+        console.log("Dremel3D45ViewModel initialized, settings:", self.settings);
+        if (self.settings && self.settings.plugins && self.settings.plugins.dremel3d45) {
+            console.log("Dremel settings:", self.settings.plugins.dremel3d45);
+        }
 
         self.sdIndexConnected = ko.observable(false);
         self.sdIndexCount = ko.observable(0);

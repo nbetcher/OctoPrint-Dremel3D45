@@ -138,21 +138,22 @@ if _OCTOPRINT_AVAILABLE:
             }
 
         def on_settings_save(self, data: dict) -> None:
-            _LOGGER.debug("Settings save requested with data keys: %s", list(data.keys()))
+            _LOGGER.info("on_settings_save called with data: %s", data)
             old_ip = self._settings.get(["printer_ip"])
 
             # Let OctoPrint persist settings
             octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
 
             new_ip = self._settings.get(["printer_ip"])
+            _LOGGER.info("Settings saved: old_ip=%r, new_ip=%r", old_ip, new_ip)
             if old_ip != new_ip:
                 _LOGGER.info("Printer IP changed from %s to %s", old_ip, new_ip)
                 if self._virtual_serial:
                     _LOGGER.warning(
                         "Printer IP changed while connected - reconnect required for changes to take effect"
                     )
-            _LOGGER.debug(
-                "Settings saved: timeout=%ss, poll_interval=%ss",
+            _LOGGER.info(
+                "Settings after save: timeout=%ss, poll_interval=%ss",
                 self._settings.get(["request_timeout"]),
                 self._settings.get(["poll_interval"]),
             )
