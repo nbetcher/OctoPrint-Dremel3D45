@@ -49,6 +49,6 @@ $(function() {
     OCTOPRINT_VIEWMODELS.push({
         construct: Dremel3D45ViewModel,
         dependencies: ["settingsViewModel"],
-        elements: ["#settings_plugin_dremel3d45"]
+        elements: ["#settings_plugin_dremel3d45_sdindex"]
     });
 });
