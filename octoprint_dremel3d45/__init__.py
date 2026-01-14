@@ -137,12 +137,12 @@ if _OCTOPRINT_AVAILABLE:
                 ]
             }
 
-        def on_settings_save(self, data: dict) -> None:
+        def on_settings_save(self, data: dict) -> dict:
             _LOGGER.info("on_settings_save called with data: %s", data)
             old_ip = self._settings.get(["printer_ip"])
 
-            # Let OctoPrint persist settings
-            octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
+            # Let OctoPrint persist settings and get the diff
+            diff = octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
 
             new_ip = self._settings.get(["printer_ip"])
             _LOGGER.info("Settings saved: old_ip=%r, new_ip=%r", old_ip, new_ip)
@@ -162,6 +162,9 @@ if _OCTOPRINT_AVAILABLE:
                 ["camera_update_global"]
             ):
                 self._configure_camera()
+
+            # Return the diff as expected by OctoPrint
+            return diff
 
         def _configure_camera(self) -> None:
             """Configure OctoPrint's webcam settings for Dremel camera."""
