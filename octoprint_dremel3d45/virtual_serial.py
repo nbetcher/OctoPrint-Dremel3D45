@@ -28,7 +28,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
-from dremel3dpy import Dremel3DPrinter, PRINT_COMMAND, default_request
+from .vendor.dremel3dpy import Dremel3DPrinter, PRINT_COMMAND, default_request
 
 if TYPE_CHECKING:
     from octoprint.settings import Settings

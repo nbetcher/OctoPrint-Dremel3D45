@@ -33,7 +33,7 @@ _LOGGER = logging.getLogger("octoprint.plugins.dremel3d45")
 
 __plugin_name__ = "Dremel 3D45"
 __plugin_pythoncompat__ = ">=3.7,<4"
-__plugin_version__ = "0.1.0"
+__plugin_version__ = "0.1.1"
 __plugin_author__ = "Nick Betcher"
 __plugin_author_email__ = "nick@nickbetcher.com"
 __plugin_url__ = "https://www.nickbetcher.com/projects/octoprint_dremel3d45"
@@ -224,6 +224,13 @@ if _OCTOPRINT_AVAILABLE:
         # -------------------------------------------------------------------------
         # SimpleApiPlugin
         # -------------------------------------------------------------------------
+
+        def is_api_protected(self):  # noqa: ANN001
+            """Explicitly declare API protection status (OctoPrint 1.11.2+).
+
+            The plugin API is intended for authenticated UI usage.
+            """
+            return True
 
         def get_api_commands(self) -> dict:
             return {
