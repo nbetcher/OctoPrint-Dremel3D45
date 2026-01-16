@@ -5,6 +5,21 @@
  */
 
 $(function() {
+    // Allow templates to opt out of parent view model bindings. OctoPrint's
+    // SettingsViewModel binds the whole settings dialog; our SD index section is
+    // bound by this plugin's view model. stopBinding prevents KO from trying to
+    // evaluate plugin-only observables in the SettingsViewModel context.
+    if (ko && ko.bindingHandlers && !ko.bindingHandlers.stopBinding) {
+        ko.bindingHandlers.stopBinding = {
+            init: function() {
+                return { controlsDescendantBindings: true };
+            }
+        };
+        if (ko.virtualElements && ko.virtualElements.allowedBindings) {
+            ko.virtualElements.allowedBindings.stopBinding = true;
+        }
+    }
+
     function Dremel3D45ViewModel(parameters) {
         var self = this;
 

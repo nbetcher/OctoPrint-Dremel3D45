@@ -139,7 +139,15 @@
 
     <h4>SD Index</h4>
 
-    <div id="settings_plugin_dremel3d45_sdindex">
+    {#
+      IMPORTANT:
+      This settings template is normally bound by OctoPrint's SettingsViewModel
+      (because custom_bindings is False). The SD Index section is bound by our
+      custom plugin ViewModel. Use stopBinding to prevent the SettingsViewModel
+      from evaluating bindings like sdIndexConnected() here.
+    #}
+    <div data-bind="stopBinding: true">
+        <div id="settings_plugin_dremel3d45_sdindex">
         <div class="alert alert-info">
             This plugin maintains an SD index mapping of uploaded filenames to the printer's internal upload names.
             The Dremel API does not provide a reliable directory listing, so this mapping is how commands like <strong>M20/M23/M32</strong> work.
@@ -175,5 +183,6 @@
                 </tr>
             </tbody>
         </table>
+        </div>
     </div>
 </div>

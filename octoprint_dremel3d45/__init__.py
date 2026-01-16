@@ -388,7 +388,7 @@ if _OCTOPRINT_AVAILABLE:
             """
             # Always show the port - if IP is not configured, user will see
             # an error when they try to connect (handled in virtual_serial_factory)
-            _LOGGER.info("get_additional_port_names hook called - returning [%s]", DREMEL_PORT_NAME)
+            _LOGGER.debug("get_additional_port_names hook called - returning [%s]", DREMEL_PORT_NAME)
             return [DREMEL_PORT_NAME]
 
         # -------------------------------------------------------------------------
