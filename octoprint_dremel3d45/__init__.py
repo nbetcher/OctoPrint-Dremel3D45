@@ -138,21 +138,21 @@ if _OCTOPRINT_AVAILABLE:
             }
 
         def on_settings_save(self, data: dict) -> dict:
-            _LOGGER.info("on_settings_save called with data: %s", data)
+            _LOGGER.debug("on_settings_save called with data: %s", data)
             old_ip = self._settings.get(["printer_ip"])
 
             # Let OctoPrint persist settings and get the diff
             diff = octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
 
             new_ip = self._settings.get(["printer_ip"])
-            _LOGGER.info("Settings saved: old_ip=%r, new_ip=%r", old_ip, new_ip)
+            _LOGGER.debug("Settings saved: old_ip=%r, new_ip=%r", old_ip, new_ip)
             if old_ip != new_ip:
                 _LOGGER.info("Printer IP changed from %s to %s", old_ip, new_ip)
                 if self._virtual_serial:
                     _LOGGER.warning(
                         "Printer IP changed while connected - reconnect required for changes to take effect"
                     )
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Settings after save: timeout=%ss, poll_interval=%ss",
                 self._settings.get(["request_timeout"]),
                 self._settings.get(["poll_interval"]),
@@ -338,23 +338,23 @@ if _OCTOPRINT_AVAILABLE:
             Called when OctoPrint tries to open a serial connection.
             If port is DREMEL3D45, return our virtual serial object.
             """
-            _LOGGER.info(
+            _LOGGER.debug(
                 "virtual_serial_factory hook called for port=%s (looking for %s)",
                 port, DREMEL_PORT_NAME,
             )
 
             if port != DREMEL_PORT_NAME:
-                _LOGGER.info("Serial factory: port %s is not our port, returning None", port)
+                _LOGGER.debug("Serial factory: port %s is not our port, returning None", port)
                 return None
 
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Serial factory called for %s (baudrate=%s, timeout=%s)",
                 port, baudrate, read_timeout,
             )
 
             # Debug: log what settings we can see
             printer_ip = self._settings.get(["printer_ip"])
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Settings check: printer_ip=%r, _settings type=%s",
                 printer_ip, type(self._settings).__name__,
             )

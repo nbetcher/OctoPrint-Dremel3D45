@@ -37,8 +37,6 @@ _LOGGER = logging.getLogger("octoprint.plugins.dremel3d45.virtual_serial")
 
 
 class DremelVirtualSerial:
-    _SD_INDEX_SCHEMA_VERSION = 1
-
     """
     Virtual serial port for Dremel 3D45 printer.
 
@@ -59,6 +57,8 @@ class DremelVirtualSerial:
     - M524 (abort) -> Cancel print
     - etc.
     """
+
+    _SD_INDEX_SCHEMA_VERSION = 1
 
     # Dremel status -> state string
     STATUS_MAP = {
@@ -435,6 +435,8 @@ class DremelVirtualSerial:
         try:
             _LOGGER.debug("Creating Dremel3DPrinter instance for host: %s", self._host)
             self._printer = Dremel3DPrinter(self._host)
+            # Explicitly fetch printer info (constructor no longer auto-refreshes)
+            self._printer.set_printer_info(refresh=True)
             self._connected = True
             _LOGGER.info("Connected to Dremel printer at %s", self._host)
 
@@ -442,11 +444,10 @@ class DremelVirtualSerial:
             firmware = self._printer.get_firmware_version() or "Unknown"
             _LOGGER.info("Printer firmware version: %s", firmware)
 
-            # Send capability report
+            # Send capability report (part of Marlin boot sequence)
             self._send(f"FIRMWARE_NAME:Dremel3D45 FIRMWARE_VERSION:{firmware}")
             self._send("Cap:AUTOREPORT_TEMP:1")
             self._send("Cap:AUTOREPORT_SD_STATUS:1")
-            self._send("ok")
 
             # Start polling thread
             _LOGGER.debug("Starting poll thread (interval=%ds)", self._poll_interval)
@@ -618,7 +619,8 @@ class DremelVirtualSerial:
 
     def _gcode_M115(self, command: str) -> None:
         """Report firmware info."""
-        if not self._printer:
+        printer = self._printer
+        if not printer:
             _LOGGER.warning("M115 requested but not connected")
             self._send("Error: Not connected")
             self._send("ok")
@@ -626,11 +628,11 @@ class DremelVirtualSerial:
         
         # Refresh printer info
         _LOGGER.debug("Refreshing printer info for M115")
-        self._printer.set_printer_info(refresh=True)
+        printer.set_printer_info(refresh=True)
         
-        machine = self._printer.get_title() or "Dremel 3D45"
-        firmware = self._printer.get_firmware_version() or "Unknown"
-        serial = self._printer.get_serial_number() or "Unknown"
+        machine = printer.get_title() or "Dremel 3D45"
+        firmware = printer.get_firmware_version() or "Unknown"
+        serial = printer.get_serial_number() or "Unknown"
         
         _LOGGER.debug(
             "Firmware info: machine=%s, firmware=%s, serial=%s",
@@ -665,9 +667,10 @@ class DremelVirtualSerial:
         door_status = "TRIGGERED" if self._door_open else "open"
         
         # Refresh door state from API
-        if self._printer:
+        printer = self._printer
+        if printer:
             try:
-                self._door_open = self._printer.is_door_open()
+                self._door_open = printer.is_door_open()
                 door_status = "TRIGGERED" if self._door_open else "open"
             except Exception:
                 pass
@@ -743,7 +746,8 @@ class DremelVirtualSerial:
 
     def _gcode_M24(self, command: str) -> None:
         """Start/resume SD print."""
-        if not self._printer:
+        printer = self._printer
+        if not printer:
             _LOGGER.warning("M24: Cannot start print - not connected")
             self._send("Error: Not connected")
             self._send("ok")
@@ -752,7 +756,7 @@ class DremelVirtualSerial:
         if self._paused:
             # Resume using library method
             _LOGGER.info("Resuming paused print")
-            self._printer.resume_print()
+            printer.resume_print()
             self._paused = False
             self._printing = True
             _LOGGER.debug("Print resumed successfully")
@@ -788,9 +792,10 @@ class DremelVirtualSerial:
 
     def _gcode_M25(self, command: str) -> None:
         """Pause SD print."""
-        if self._printing and self._printer:
+        printer = self._printer
+        if self._printing and printer:
             _LOGGER.info("Pausing print")
-            self._printer.pause_print()
+            printer.pause_print()
             self._paused = True
             _LOGGER.debug("Print paused successfully")
         else:
@@ -853,8 +858,9 @@ class DremelVirtualSerial:
     def _gcode_M524(self, command: str) -> None:
         """Abort SD print (Marlin 2.0+)."""
         _LOGGER.info("Aborting print (M524)")
-        if self._printer:
-            self._printer.stop_print()
+        printer = self._printer
+        if printer:
+            printer.stop_print()
             _LOGGER.debug("Stop command sent to printer")
         self._printing = False
         self._paused = False
@@ -1085,9 +1091,10 @@ class DremelVirtualSerial:
     def _gcode_M112(self, command: str) -> None:
         """Emergency stop."""
         _LOGGER.critical("EMERGENCY STOP requested (M112)!")
-        if self._printer:
+        printer = self._printer
+        if printer:
             _LOGGER.info("Sending stop command to printer")
-            self._printer.stop_print()
+            printer.stop_print()
         self._printing = False
         self._paused = False
         _LOGGER.info("Emergency stop executed - print state reset")
@@ -1330,26 +1337,16 @@ class DremelVirtualSerial:
             printer.set_job_status(refresh=True)
             
             with self._lock:
-                # Get actual temperatures using library methods
+                # Get temperatures from API
                 tool_actual = float(printer.get_temperature_type("extruder") or 0)
                 bed_actual = float(printer.get_temperature_type("platform") or 0)
                 chamber_actual = float(printer.get_temperature_type("chamber") or 0)
                 
-                # For target temps: ALWAYS prefer our locally-set values since the Dremel API
-                # reports bogus target temps (e.g., 270 when we set 100).
-                # Only fall back to API values if we haven't set targets ourselves.
                 tool_attrs = printer.get_temperature_attributes("extruder") or {}
                 bed_attrs = printer.get_temperature_attributes("platform") or {}
                 
-                api_tool_target = float(tool_attrs.get("target_temp", 0) or 0)
-                api_bed_target = float(bed_attrs.get("target_temp", 0) or 0)
-                
-                current_tool_target = self._temps.get("tool0", (0, 0))[1]
-                current_bed_target = self._temps.get("bed", (0, 0))[1]
-                
-                # Prefer local target; fall back to API only during firmware-initiated prints
-                tool_target = current_tool_target if current_tool_target > 0 else api_tool_target
-                bed_target = current_bed_target if current_bed_target > 0 else api_bed_target
+                tool_target = float(tool_attrs.get("target_temp", 0) or 0)
+                bed_target = float(bed_attrs.get("target_temp", 0) or 0)
                 
                 self._temps = {
                     "tool0": (tool_actual, tool_target),
@@ -1358,21 +1355,13 @@ class DremelVirtualSerial:
                 }
                 
                 # Parse print status using library methods
-                was_active = self._printing or self._paused
                 self._printing = printer.is_printing()
                 self._paused = printer.is_paused()
                 is_active = self._printing or self._paused
                 
                 # Detect print completion: was printing/paused, now idle
                 if self._was_printing and not is_active:
-                    _LOGGER.info("Print completed - resetting temperature targets")
-                    # Reset locally-tracked temp targets since print is done
-                    self._temps = {
-                        "tool0": (tool_actual, 0.0),
-                        "bed": (bed_actual, 0.0),
-                        "chamber": (chamber_actual, 0),
-                    }
-                    # Clear selected file
+                    _LOGGER.info("Print completed")
                     self._selected_file_display = ""
                     self._selected_file_remote = ""
                     self._selected_file_size = 0
@@ -1523,7 +1512,8 @@ class DremelVirtualSerial:
         """
         _LOGGER.info("Upload requested: %s -> %s", local_path, remote_name)
         
-        if not self._printer:
+        printer = self._printer
+        if not printer:
             _LOGGER.error("Cannot upload: not connected to printer")
             return False
 
@@ -1533,10 +1523,9 @@ class DremelVirtualSerial:
             
         try:
             _LOGGER.debug("Reading file content from: %s", local_path)
-            # Use the library's start_print_from_file which uploads and starts
-            # For upload-only, we'd need to use the internal API
-            # The library's _upload_print method accepts file content
-            with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+            # Read as binary to avoid corrupting gcode files with
+            # non-UTF-8 bytes (e.g., binary thumbnails from PrusaSlicer)
+            with open(local_path, "rb") as f:
                 file_content = f.read()
 
             try:
@@ -1547,7 +1536,7 @@ class DremelVirtualSerial:
             
             # Use the library's internal upload method
             _LOGGER.debug("Uploading file content to printer...")
-            uploaded_name = self._printer._upload_print(file_content)
+            uploaded_name = printer._upload_print(file_content)
             _LOGGER.info(
                 "File uploaded successfully: %s -> %s (size=%d bytes)",
                 local_path, uploaded_name, file_size,

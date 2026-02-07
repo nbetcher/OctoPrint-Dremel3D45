@@ -13,7 +13,6 @@ This library supports the three Dremel models: 3D20, 3D40 and 3D45.
 more information. I am in no way affiliated with Dremel.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -24,7 +23,6 @@ from typing import Any, Dict
 
 import requests
 import validators
-from urllib3.exceptions import InsecureRequestWarning
 from urllib.parse import urlunsplit
 
 from .helpers.constants import (
@@ -100,7 +98,6 @@ class Dremel3DPrinter:
         self._is_starting = False
         self._is_heating = False
         self._is_finished = False
-        self.refresh()
 
     def set_printer_info(self, refresh=False):
         """Return attributes related to the printer."""
@@ -117,11 +114,14 @@ class Dremel3DPrinter:
                     title = re.search(
                         r"DREMEL [^\s+]+", printer_info[CONF_MACHINE_TYPE]
                     ).group(0)
+                except Exception:
+                    title = printer_info.get(CONF_MACHINE_TYPE, "Dremel 3D45")
+                try:
                     model = re.search(
                         r"DREMEL ([^\s+]+)", printer_info[CONF_MACHINE_TYPE]
                     ).group(1)
-                except Exception:  # pylint: disable=try-except-raise
-                    raise
+                except Exception:
+                    model = "3D45"
                 self._printer_info = {
                     CONF_HOST: self._host,
                     CONF_API_VERSION: printer_info[CONF_API_VERSION],
@@ -147,7 +147,7 @@ class Dremel3DPrinter:
             try:
                 last_printing_status = (
                     self.get_printing_status()
-                    if self.get_job_status() is not None
+                    if self._job_status is not None
                     else "idle"
                 )
                 job_status = default_request(self._host, PRINTER_STATUS_COMMAND)
@@ -233,7 +233,7 @@ class Dremel3DPrinter:
                         and current_printing_status == "completed"
                     ):
                         self._is_finished = True
-                    info_msg = "Printer changed its phase from {last_printing_status} to {current_printing_status}."
+                    info_msg = f"Printer changed its phase from {last_printing_status} to {current_printing_status}."
                     _LOGGER.info(info_msg)
                     last_printing_status = current_printing_status
             # Patch fix the total time. Sometimes when in a printing job this API can
@@ -295,7 +295,7 @@ class Dremel3DPrinter:
         return (self._printer_info or {}) | (self._printer_extra_stats or {})
 
     def get_job_status(self) -> Dict[str, Any]:
-        return self._job_status
+        return self._job_status or {}
 
     def get_manufacturer(self) -> str:
         return DREMEL_MANUFACTURER
@@ -400,11 +400,10 @@ class Dremel3DPrinter:
         return self.get_job_status().get(f"{temp_type}_temperature")
 
     def get_temperature_attributes(self, temp_type: str) -> Dict[str, int]:
+        max_temp_raw = self.get_printer_info().get(f"{temp_type}_max_temperature")
         return {
             "target_temp": self.get_job_status().get(f"{temp_type}_target_temperature"),
-            "max_temp": int(
-                self.get_printer_info().get(f"{temp_type}_max_temperature")
-            ),
+            "max_temp": int(max_temp_raw) if max_temp_raw is not None else 0,
         }
 
     def is_maybe_temperature_within_target_range(self, temp_type) -> bool:
@@ -422,7 +421,7 @@ class Dremel3DPrinter:
             ]
         )
 
-    def _upload_print(self: str, file: str) -> str:
+    def _upload_print(self, file) -> str:
         try:
             filename = (
                 "".join(random.choice(string.ascii_letters) for i in range(10))
@@ -435,8 +434,8 @@ class Dremel3DPrinter:
             )
         except Exception as exc:  # pylint: disable=broad-except
             raise exc
-        if error_code := response.status_code != 200:
-            raise RuntimeError(f"Upload failed with status code {error_code}")
+        if response.status_code != 200:
+            raise RuntimeError(f"Upload failed with status code {response.status_code}")
 
         return filename
 
@@ -541,7 +540,6 @@ def default_request(
     netloc = f"{host}:{port}" if port else str(host)
     url = urlunsplit((scheme, netloc, path, "", ""))
 
-    requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
     response = requests.post(url, data=command, timeout=REQUEST_TIMEOUT, verify=False)
 
     response_json = json.loads(response.content.decode("utf-8"))
