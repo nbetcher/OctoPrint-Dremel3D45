@@ -149,9 +149,14 @@ if _OCTOPRINT_AVAILABLE:
             if old_ip != new_ip:
                 _LOGGER.info("Printer IP changed from %s to %s", old_ip, new_ip)
                 if self._virtual_serial:
-                    _LOGGER.warning(
-                        "Printer IP changed while connected - reconnect required for changes to take effect"
+                    _LOGGER.info(
+                        "Closing existing connection due to IP change"
                     )
+                    try:
+                        self._virtual_serial.close()
+                    except Exception as e:
+                        _LOGGER.warning("Error closing virtual serial on IP change: %s", e)
+                    self._virtual_serial = None
             _LOGGER.debug(
                 "Settings after save: timeout=%ss, poll_interval=%ss",
                 self._settings.get(["request_timeout"]),
@@ -197,6 +202,32 @@ if _OCTOPRINT_AVAILABLE:
             except Exception as e:
                 _LOGGER.warning("Failed to update global webcam settings: %s", e)
 
+        def _handle_test_connection(self):
+            """Test connection to Dremel printer and return status."""
+            from flask import jsonify
+
+            printer_ip = self._settings.get(["printer_ip"])
+            if not printer_ip:
+                return jsonify(ok=False, error="No printer IP configured")
+
+            _LOGGER.info("Testing connection to %s", printer_ip)
+            try:
+                from .vendor.dremel3dpy import Dremel3DPrinter
+                from .vendor.dremel3dpy.helpers import constants as _c
+
+                _c.REQUEST_TIMEOUT = self._settings.get_int(["request_timeout"]) or 30
+
+                printer = Dremel3DPrinter(printer_ip)
+                printer.set_printer_info(refresh=True)
+                fw = printer.get_firmware_version() or "Unknown"
+                model = printer.get_title() or "Unknown"
+                sn = printer.get_serial_number() or "Unknown"
+                _LOGGER.info("Connection test succeeded: %s (fw=%s)", model, fw)
+                return jsonify(ok=True, firmware=fw, model=model, serial=sn)
+            except Exception as e:
+                _LOGGER.warning("Connection test failed: %s", e)
+                return jsonify(ok=False, error=str(e))
+
         # -------------------------------------------------------------------------
         # TemplatePlugin
         # -------------------------------------------------------------------------
@@ -235,6 +266,7 @@ if _OCTOPRINT_AVAILABLE:
         def get_api_commands(self) -> dict:
             return {
                 "clear_sd_index": [],
+                "test_connection": [],
             }
 
         def on_api_get(self, request):  # noqa: ANN001
@@ -291,6 +323,10 @@ if _OCTOPRINT_AVAILABLE:
 
         def on_api_command(self, command: str, data):  # noqa: ANN001
             _LOGGER.debug("API command received: %s", command)
+
+            if command == "test_connection":
+                return self._handle_test_connection()
+
             if command != "clear_sd_index":
                 _LOGGER.debug("Unknown API command: %s", command)
                 return

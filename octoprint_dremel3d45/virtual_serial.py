@@ -60,10 +60,25 @@ class DremelVirtualSerial:
 
     _SD_INDEX_SCHEMA_VERSION = 1
 
+    # When file size is unknown (external prints), use a synthetic size so
+    # OctoPrint's SD progress tracking gets proportional byte counts.
+    # Must be large enough to avoid OctoPrint's "current == total" end-of-print
+    # check triggering prematurely, but the actual value is arbitrary since
+    # progress is derived from the Dremel API percentage.
+    _SYNTHETIC_FILE_SIZE = 1000000
+
+    # Dremel job phases that indicate an active print job.
+    # Values from REST API: idle, preparing, building, completed, abort,
+    #                       paused, pausing, resuming
+    _ACTIVE_PHASES = frozenset({"preparing", "building", "paused", "pausing", "resuming"})
+
+    # Dremel job phases that indicate a print has finished (success or cancel).
+    _TERMINAL_PHASES = frozenset({"completed", "abort"})
+
     # Dremel status -> state string
     STATUS_MAP = {
         "ready": "operational",
-        "building": "printing", 
+        "building": "printing",
         "paused": "paused",
         "completed": "operational",
         "cancelling": "cancelling",
@@ -94,6 +109,10 @@ class DremelVirtualSerial:
         self._host = settings.get(["printer_ip"]) or ""
         self._request_timeout = settings.get_int(["request_timeout"]) or 30
 
+        # Apply configured timeout to vendored library (module-level constant)
+        from .vendor.dremel3dpy.helpers import constants as _dremel_constants
+        _dremel_constants.REQUEST_TIMEOUT = self._request_timeout
+
         _LOGGER.debug("Printer host: %s, request timeout: %ds", self._host, self._request_timeout)
 
         # Response queue - OctoPrint reads from here
@@ -119,7 +138,12 @@ class DremelVirtualSerial:
         self._printing = False
         self._paused = False
         self._was_printing = False  # Track previous state to detect print completion
+        self._job_phase = "idle"  # Current Dremel API job phase
+        self._last_job_phase = "idle"  # Previous job phase for transition detection
+        self._completion_sent = False  # One-shot guard for completion messages
+        self._last_announced_job_name = ""  # Last job name sent in File opened:
         self._progress = 0
+        self._progress_from_host = False  # Guard: host-set M73 progress vs API
         self._elapsed_time = 0
         self._remaining_time = 0
         self._current_layer = 0
@@ -600,8 +624,7 @@ class DremelVirtualSerial:
     # -------------------------------------------------------------------------
 
     def _gcode_M105(self, command: str) -> None:
-        """Report temperatures."""
-        self._refresh_status()
+        """Report temperatures (from poll cache)."""
         t0 = self._temps.get("tool0", (0, 0))
         bed = self._temps.get("bed", (0, 0))
         chamber = self._temps.get("chamber", (0, 0))
@@ -776,8 +799,11 @@ class DremelVirtualSerial:
             )
             try:
                 default_request(self._host, {PRINT_COMMAND: self._selected_file_remote})
-                self._printing = True
-                self._paused = False
+                # Don't set _printing here; poll thread will discover the
+                # phase transition ("preparing"/"building") authoritatively.
+                # Mark as announced so poll doesn't re-emit File opened.
+                self._was_printing = True
+                self._last_announced_job_name = self._selected_file_display
                 _LOGGER.info("Print started successfully")
                 self._send("ok")
             except Exception as e:
@@ -794,9 +820,15 @@ class DremelVirtualSerial:
         printer = self._printer
         if self._printing and printer:
             _LOGGER.info("Pausing print")
-            printer.pause_print()
-            self._paused = True
-            _LOGGER.debug("Print paused successfully")
+            try:
+                success = printer.pause_print()
+                if success:
+                    self._paused = True
+                    _LOGGER.debug("Print paused successfully")
+                else:
+                    _LOGGER.warning("Pause command returned failure")
+            except Exception as e:
+                _LOGGER.error("Failed to pause print: %s", e)
         else:
             _LOGGER.debug("M25: Not printing - nothing to pause")
         self._send("ok")
@@ -830,17 +862,11 @@ class DremelVirtualSerial:
             self._send("ok")
             return
 
-        self._refresh_status()
-        
         if self._printing or self._paused:
             # Format: SD printing byte X/Y
-            total = int(self._selected_file_size or 0)
-            if total > 0:
-                printed = int((float(self._progress) / 100.0) * float(total))
-                self._send(f"SD printing byte {printed}/{total}")
-            else:
-                printed = int(self._progress)
-                self._send(f"SD printing byte {printed}/100")
+            total = int(self._selected_file_size or self._SYNTHETIC_FILE_SIZE)
+            printed = int((float(self._progress) / 100.0) * float(total))
+            self._send(f"SD printing byte {printed}/{total}")
             _LOGGER.debug("SD status: progress=%.1f%%, layer=%d", self._progress, self._current_layer)
         else:
             _LOGGER.debug("SD status: not printing")
@@ -866,6 +892,13 @@ class DremelVirtualSerial:
         self._selected_file_display = ""
         self._selected_file_remote = ""
         self._selected_file_size = 0
+        # Sync phase-tracking state to prevent poll from re-triggering transitions
+        self._was_printing = False
+        self._job_phase = "idle"
+        self._last_job_phase = "idle"
+        self._completion_sent = True  # Suppress redundant completion from poll
+        self._last_announced_job_name = ""
+        self._progress_from_host = False
         _LOGGER.info("Print aborted - state reset")
         self._send("ok")
 
@@ -1096,6 +1129,16 @@ class DremelVirtualSerial:
             printer.stop_print()
         self._printing = False
         self._paused = False
+        self._selected_file_display = ""
+        self._selected_file_remote = ""
+        self._selected_file_size = 0
+        # Sync phase-tracking state to prevent poll from re-triggering transitions
+        self._was_printing = False
+        self._job_phase = "idle"
+        self._last_job_phase = "idle"
+        self._completion_sent = True  # Suppress redundant completion from poll
+        self._last_announced_job_name = ""
+        self._progress_from_host = False
         _LOGGER.info("Emergency stop executed - print state reset")
         self._send("ok")
 
@@ -1164,6 +1207,7 @@ class DremelVirtualSerial:
         if not resolved:
             _LOGGER.warning("M32: File not found: %s", filename)
             self._send("Error: File not found")
+            self._send("ok")
             return
 
         display_name, remote_name, file_size = resolved
@@ -1180,22 +1224,26 @@ class DremelVirtualSerial:
         self._gcode_M24("M24")
 
     def _gcode_M73(self, command: str) -> None:
-        """Set build progress (best-effort). Format: M73 P<percent> [R<min>]"""
+        """Set build progress (best-effort). Format: M73 P<percent> [R<min>]
+
+        Host-set progress is used until the next API refresh, which is
+        authoritative for the Dremel printer.
+        """
         match = re.search(r"P(\d+)", command)
         if match:
             try:
                 self._progress = float(match.group(1))
+                self._progress_from_host = True
             except Exception:
                 pass
         self._send("ok")
 
     def _gcode_M532(self, command: str) -> None:
-        """Report job progress with layer info (Prusa-style).
+        """Report job progress with layer info (Prusa-style, from poll cache).
         
         Format: X:<percent> L:<layer>
         Some hosts (OctoPrint plugins) parse this for layer display.
         """
-        self._refresh_status()
         self._send(f"X:{self._progress:.1f} L:{self._current_layer}")
         self._send("ok")
 
@@ -1330,33 +1378,43 @@ class DremelVirtualSerial:
         printer = self._printer
         if not printer:
             return
-            
+
         try:
             # Refresh job status from library (makes ONE API call internally)
             printer.set_job_status(refresh=True)
-            
+
             with self._lock:
                 # Get temperatures from API
                 tool_actual = float(printer.get_temperature_type("extruder") or 0)
                 bed_actual = float(printer.get_temperature_type("platform") or 0)
                 chamber_actual = float(printer.get_temperature_type("chamber") or 0)
-                
+
                 tool_attrs = printer.get_temperature_attributes("extruder") or {}
                 bed_attrs = printer.get_temperature_attributes("platform") or {}
-                
+
                 tool_target = float(tool_attrs.get("target_temp", 0) or 0)
                 bed_target = float(bed_attrs.get("target_temp", 0) or 0)
-                
+
                 self._temps = {
                     "tool0": (tool_actual, tool_target),
                     "bed": (bed_actual, bed_target),
                     "chamber": (chamber_actual, 0),
                 }
-                
-                # Parse print status using library methods
-                self._printing = printer.is_printing()
-                self._paused = printer.is_paused()
-                is_active = self._printing or self._paused
+
+                # Get job phase directly from the Dremel API
+                try:
+                    phase = (printer.get_printing_status() or "idle").strip().lower()
+                except Exception:
+                    phase = "idle"
+
+                self._last_job_phase = self._job_phase
+                self._job_phase = phase
+
+                # Derive printing/paused state from phase
+                is_active = phase in self._ACTIVE_PHASES
+                is_terminal = phase in self._TERMINAL_PHASES
+                self._printing = phase in ("building", "preparing", "resuming")
+                self._paused = phase in ("paused", "pausing")
 
                 # Get job name for external print detection
                 try:
@@ -1364,16 +1422,18 @@ class DremelVirtualSerial:
                 except Exception:
                     job_name = ""
 
-                # Detect externally-started prints (started from touchscreen/USB)
-                # When the printer transitions from idle to printing without
-                # OctoPrint having sent M23/M24, we emit "File opened:" /
-                # "File selected" so OctoPrint's comm module creates a
-                # PrintingSdFileInformation and can auto-detect the SD print.
-                if is_active and not self._was_printing:
+                was_active = self._was_printing
+
+                # ----------------------------------------------------------
+                # Transition: idle/terminal → active (print started)
+                # ----------------------------------------------------------
+                if is_active and not was_active:
                     _LOGGER.info(
-                        "Print started (external detection): job=%s",
-                        job_name or "(unknown)",
+                        "Print started (phase=%s): job=%s",
+                        phase, job_name or "(unknown)",
                     )
+                    self._completion_sent = False
+
                     # Sync job name into selected file tracking
                     if job_name:
                         self._selected_file_remote = job_name
@@ -1386,54 +1446,107 @@ class DremelVirtualSerial:
                                 break
                         self._selected_file_display = display_name or job_name
                     elif not self._selected_file_display:
-                        self._selected_file_display = "print.gcode"
-                        self._selected_file_remote = "print.gcode"
+                        self._selected_file_display = "unknown_job.gcode"
+                        self._selected_file_remote = "unknown_job.gcode"
+
+                    # Ensure we have a usable file size.
+                    if not self._selected_file_size:
+                        self._selected_file_size = self._SYNTHETIC_FILE_SIZE
 
                     # Tell OctoPrint a file is selected so it can enter
                     # the SD printing state when it sees progress bytes.
-                    file_display = self._selected_file_display or "print.gcode"
-                    file_size = int(self._selected_file_size or 0)
+                    file_display = self._selected_file_display or "unknown_job.gcode"
+                    file_size = int(self._selected_file_size)
                     self._send(f"File opened: {file_display} Size: {file_size}")
                     self._send("File selected")
+                    self._last_announced_job_name = file_display
 
-                # Detect print completion: was printing/paused, now idle
-                elif self._was_printing and not is_active:
-                    _LOGGER.info("Print completed")
+                # ----------------------------------------------------------
+                # Active → active: check for late job-name discovery
+                # ----------------------------------------------------------
+                elif is_active and was_active:
+                    if (
+                        job_name
+                        and self._last_announced_job_name
+                        and self._last_announced_job_name == "unknown_job.gcode"
+                        and job_name != self._last_announced_job_name
+                    ):
+                        # Real job name appeared after we used a placeholder;
+                        # re-announce so OctoPrint updates its file display.
+                        _LOGGER.info(
+                            "Late job name discovered: %s (was %s)",
+                            job_name, self._last_announced_job_name,
+                        )
+                        self._selected_file_remote = job_name
+                        display_name = ""
+                        for disp, meta in self._sd_index.items():
+                            if (meta.get("remote") or "").lower() == job_name.lower():
+                                display_name = meta.get("display") or disp
+                                self._selected_file_size = int(meta.get("size") or 0)
+                                break
+                        self._selected_file_display = display_name or job_name
+                        if not self._selected_file_size:
+                            self._selected_file_size = self._SYNTHETIC_FILE_SIZE
+
+                        file_display = self._selected_file_display
+                        file_size = int(self._selected_file_size)
+                        self._send(f"File opened: {file_display} Size: {file_size}")
+                        self._send("File selected")
+                        self._last_announced_job_name = file_display
+
+                # ----------------------------------------------------------
+                # Transition: active → terminal (completed / abort)
+                # ----------------------------------------------------------
+                elif is_terminal and was_active and not self._completion_sent:
+                    _LOGGER.info("Print finished (phase=%s)", phase)
                     # Send final 100% progress so OctoPrint marks print done
-                    total = int(self._selected_file_size or 100)
+                    total = int(self._selected_file_size or self._SYNTHETIC_FILE_SIZE)
                     self._send(f"SD printing byte {total}/{total}")
-                    # Then report not printing so OctoPrint transitions out
                     self._send("Not SD printing")
                     self._selected_file_display = ""
                     self._selected_file_remote = ""
                     self._selected_file_size = 0
+                    self._last_announced_job_name = ""
+                    self._progress_from_host = False
+                    self._completion_sent = True
+
+                # ----------------------------------------------------------
+                # Terminal → idle: clear completion guard
+                # ----------------------------------------------------------
+                elif phase == "idle" and self._last_job_phase in self._TERMINAL_PHASES:
+                    self._completion_sent = False
 
                 self._was_printing = is_active
-                
-                self._progress = float(printer.get_printing_progress() or 0)
+
+                api_progress = float(printer.get_printing_progress() or 0)
+                if not self._progress_from_host:
+                    self._progress = api_progress
+                else:
+                    # Host-set progress (via M73) takes precedence for one
+                    # poll cycle; API is authoritative and resumes next time.
+                    self._progress_from_host = False
                 self._elapsed_time = int(printer.get_elapsed_time() or 0)
                 self._remaining_time = int(printer.get_remaining_time() or 0)
                 self._current_layer = int(printer.get_layer() or 0)
-                
+
                 # Capture additional sensor data
                 try:
                     self._door_open = printer.is_door_open()
                 except Exception:
                     pass
                 try:
-                    job_status = printer.get_job_status() or {}
-                    self._filament_type = str(job_status.get("filament", "") or "").strip()
-                    self._fan_speed = int(job_status.get("fan_speed", 0) or 0)
+                    job_status_dict = printer.get_job_status() or {}
+                    self._filament_type = str(job_status_dict.get("filament", "") or "").strip()
+                    self._fan_speed = int(job_status_dict.get("fan_speed", 0) or 0)
                 except Exception:
                     pass
-                
+
                 # Reset error counter on successful refresh
                 self._connection_errors = 0
 
                 # Best-effort: keep selected file in sync with the active job name
-                if (self._printing or self._paused) and job_name:
+                if is_active and job_name:
                     self._selected_file_remote = job_name
-                    # If we previously uploaded this via OctoPrint, map back to display name
                     display_name = ""
                     for disp, meta in self._sd_index.items():
                         if (meta.get("remote") or "").lower() == job_name.lower():
@@ -1442,7 +1555,7 @@ class DremelVirtualSerial:
                             break
                     if display_name:
                         self._selected_file_display = display_name
-                
+
         except Exception as e:
             self._connection_errors += 1
             if self._connection_errors <= 3:
@@ -1502,15 +1615,16 @@ class DremelVirtualSerial:
     def _poll_loop(self) -> None:
         """Background thread to poll printer status."""
         _LOGGER.info("Starting status polling thread")
-        
+
         while not self._poll_stop.wait(self._poll_interval):
             try:
                 self._refresh_status()
 
                 now = time.time()
+                is_active = self._printing or self._paused
 
                 # Auto-report temperature (Marlin-style) if enabled, or if printing
-                should_report_temp = (self._printing or self._paused) or self._autotemp_enabled
+                should_report_temp = is_active or self._autotemp_enabled
                 if should_report_temp:
                     interval = self._autotemp_interval if self._autotemp_enabled else 0
                     if interval <= 0 or (now - self._last_autotemp_ts) >= float(interval):
@@ -1521,22 +1635,33 @@ class DremelVirtualSerial:
                         )
                         self._last_autotemp_ts = now
 
-                # Auto-report SD status if enabled
-                if self._autosd_enabled and self._autosd_interval > 0:
+                # -------------------------------------------------------
+                # SD progress: always report during active prints so
+                # OctoPrint transitions into "Printing from SD" even for
+                # external (touchscreen) prints.  Also honour M27 auto-
+                # report if enabled.
+                # -------------------------------------------------------
+                if is_active:
+                    total = int(self._selected_file_size or self._SYNTHETIC_FILE_SIZE)
+                    printed = int((float(self._progress) / 100.0) * float(total))
+                    self._send(f"SD printing byte {printed}/{total}")
+
+                    # Proactive layer reporting for plugins like
+                    # DisplayLayerProgress which parse //action:notification
+                    # lines from serial output.
+                    if self._current_layer > 0:
+                        self._send(
+                            f"//action:notification Layer {self._current_layer}"
+                        )
+
+                elif self._autosd_enabled and self._autosd_interval > 0:
+                    # When idle, only send "Not SD printing" if auto-report
+                    # is enabled AND enough time has elapsed.
                     if (now - self._last_autosd_ts) >= float(self._autosd_interval):
-                        if self._printing or self._paused:
-                            total = int(self._selected_file_size or 0)
-                            if total > 0:
-                                printed = int((float(self._progress) / 100.0) * float(total))
-                                self._send(f"SD printing byte {printed}/{total}")
-                            else:
-                                # No file size known — use progress as 0-100 byte scale
-                                printed = int(self._progress)
-                                self._send(f"SD printing byte {printed}/100")
-                        else:
+                        if not self._was_printing:
                             self._send("Not SD printing")
                         self._last_autosd_ts = now
-                    
+
             except Exception as e:
                 _LOGGER.debug("Poll error: %s", e)
 

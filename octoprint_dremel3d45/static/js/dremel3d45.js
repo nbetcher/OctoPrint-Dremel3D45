@@ -66,4 +66,32 @@ $(function() {
         dependencies: ["settingsViewModel"],
         elements: ["#settings_plugin_dremel3d45_sdindex"]
     });
+
+    // Test connection button handler (outside Knockout bindings)
+    $(document).on("click", "#settings-dremel3d45-test_connection", function() {
+        var btn = $(this);
+        var result = $("#settings-dremel3d45-test_result");
+        btn.prop("disabled", true).html("Testing\u2026");
+        result.hide();
+
+        OctoPrint.simpleApiCommand("dremel3d45", "test_connection", {})
+            .done(function(resp) {
+                if (resp.ok) {
+                    result.text("\u2713 Connected: " + resp.model +
+                                " (FW " + resp.firmware + ", SN " + resp.serial + ")")
+                          .removeClass("text-error").addClass("text-success").show();
+                } else {
+                    result.text("\u2717 " + (resp.error || "Connection failed"))
+                          .removeClass("text-success").addClass("text-error").show();
+                }
+            })
+            .fail(function() {
+                result.text("\u2717 Request failed")
+                      .removeClass("text-success").addClass("text-error").show();
+            })
+            .always(function() {
+                btn.prop("disabled", false)
+                   .html('<i class="fas fa-plug"></i> Test Connection');
+            });
+    });
 });
