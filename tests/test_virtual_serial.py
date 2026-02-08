@@ -365,5 +365,242 @@ class TestMarlinChecksum(unittest.TestCase):
         self.assertEqual(compute("N0 M110"), 35)
 
 
+class TestSDProgressFormat(unittest.TestCase):
+    """Test SD progress reporting uses byte-count format."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        mock_printer_class.return_value = self.mock_printer
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.serial = DremelVirtualSerial(
+            settings=MockSettings(),
+            read_timeout=1.0,
+            data_folder=None,
+        )
+        self._drain()
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain(self):
+        """Drain all pending responses."""
+        responses = []
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                line = self.serial._outgoing.get_nowait()
+                responses.append(line.strip())
+            except queue.Empty:
+                break
+        return responses
+
+    def _send_command(self, command):
+        self.serial.write(f"{command}\n".encode())
+        time.sleep(0.05)
+        return self._drain()
+
+    def test_m27_uses_byte_counts_when_file_size_known(self):
+        """M27 should report byte position/total, not percentage."""
+        # Must set mock to return printing=True since M27 calls _refresh_status
+        self.mock_printer.is_printing.return_value = True
+        self.mock_printer.get_job_name.return_value = "test.gcode"
+        self.serial._printing = True
+        self.serial._was_printing = True  # Prevent "File opened" from external detection
+        self.serial._selected_file_display = "test.gcode"
+        self.serial._selected_file_remote = "test.gcode"
+        self.serial._selected_file_size = 50000
+        self.serial._progress = 50.0  # 50%
+        self.mock_printer.get_printing_progress.return_value = 50.0
+        responses = self._send_command("M27")
+        sd_lines = [r for r in responses if r.startswith("SD printing byte")]
+        self.assertEqual(len(sd_lines), 1)
+        self.assertEqual(sd_lines[0], "SD printing byte 25000/50000")
+
+    def test_m27_uses_percentage_fallback_when_no_file_size(self):
+        """M27 should fall back to percentage/100 when file size unknown."""
+        self.mock_printer.is_printing.return_value = True
+        self.mock_printer.get_job_name.return_value = "test.gcode"
+        self.serial._printing = True
+        self.serial._was_printing = True
+        self.serial._selected_file_display = "test.gcode"
+        self.serial._selected_file_remote = "test.gcode"
+        self.serial._selected_file_size = 0
+        self.serial._progress = 42.0
+        self.mock_printer.get_printing_progress.return_value = 42.0
+        responses = self._send_command("M27")
+        sd_lines = [r for r in responses if r.startswith("SD printing byte")]
+        self.assertEqual(len(sd_lines), 1)
+        self.assertEqual(sd_lines[0], "SD printing byte 42/100")
+
+    def test_m27_reports_not_printing_when_idle(self):
+        """M27 should report 'Not SD printing' when not printing."""
+        self.serial._printing = False
+        self.serial._paused = False
+        responses = self._send_command("M27")
+        self.assertIn("Not SD printing", responses)
+
+
+class TestExternalPrintDetection(unittest.TestCase):
+    """Test detection of prints started from printer touchscreen."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        self.mock_printer.is_door_open.return_value = False
+        self.mock_printer.get_job_status.return_value = {}
+        mock_printer_class.return_value = self.mock_printer
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.serial = DremelVirtualSerial(
+            settings=MockSettings(),
+            read_timeout=1.0,
+            data_folder=None,
+        )
+        self._drain()
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain(self):
+        responses = []
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                line = self.serial._outgoing.get_nowait()
+                responses.append(line.strip())
+            except queue.Empty:
+                break
+        return responses
+
+    def test_external_print_sends_file_opened(self):
+        """When printer starts externally, File opened + File selected are sent."""
+        # Simulate: printer transitions from idle to printing
+        self.mock_printer.is_printing.return_value = True
+        self.mock_printer.get_job_name.return_value = "mypart.gcode"
+        self.mock_printer.get_printing_progress.return_value = 5.0
+
+        self.serial._refresh_status()
+        responses = self._drain()
+
+        file_opened = [r for r in responses if r.startswith("File opened:")]
+        file_selected = [r for r in responses if r == "File selected"]
+        self.assertEqual(len(file_opened), 1, f"Expected 'File opened:', got {responses}")
+        self.assertIn("mypart.gcode", file_opened[0])
+        self.assertEqual(len(file_selected), 1)
+
+    def test_external_print_no_duplicate_file_opened(self):
+        """Second _refresh_status during same print should NOT re-send File opened."""
+        self.mock_printer.is_printing.return_value = True
+        self.mock_printer.get_job_name.return_value = "test.gcode"
+        self.mock_printer.get_printing_progress.return_value = 10.0
+
+        self.serial._refresh_status()
+        self._drain()  # discard
+
+        # Second refresh — already printing
+        self.serial._refresh_status()
+        responses = self._drain()
+
+        file_opened = [r for r in responses if r.startswith("File opened:")]
+        self.assertEqual(len(file_opened), 0, "Should not re-send File opened")
+
+    def test_print_completion_sends_not_sd_printing(self):
+        """When print finishes, final progress + Not SD printing are sent."""
+        # First: simulate printing
+        self.mock_printer.is_printing.return_value = True
+        self.mock_printer.get_job_name.return_value = "part.gcode"
+        self.mock_printer.get_printing_progress.return_value = 50.0
+        self.serial._refresh_status()
+        self._drain()
+
+        # Then: simulate print done
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_progress.return_value = 0
+
+        self.serial._refresh_status()
+        responses = self._drain()
+
+        not_sd = [r for r in responses if r == "Not SD printing"]
+        self.assertEqual(len(not_sd), 1, f"Expected 'Not SD printing', got {responses}")
+        # Should also have sent final 100% progress
+        sd_byte = [r for r in responses if r.startswith("SD printing byte")]
+        self.assertEqual(len(sd_byte), 1)
+
+
+class TestBootSequence(unittest.TestCase):
+    """Test that boot sequence is minimal (no eager capabilities)."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def test_boot_does_not_send_capabilities(self, mock_printer_class):
+        """Boot should only send empty line + start, NOT FIRMWARE_NAME or Cap:."""
+        mock_printer = MagicMock()
+        mock_printer.get_firmware_version.return_value = "1.0.0"
+        mock_printer.is_printing.return_value = False
+        mock_printer.is_paused.return_value = False
+        mock_printer.get_printing_progress.return_value = 0
+        mock_printer.get_elapsed_time.return_value = 0
+        mock_printer.get_remaining_time.return_value = 0
+        mock_printer.get_layer.return_value = 0
+        mock_printer.get_job_name.return_value = ""
+        mock_printer_class.return_value = mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        serial = DremelVirtualSerial(
+            settings=MockSettings(),
+            read_timeout=1.0,
+            data_folder=None,
+        )
+        try:
+            # Collect all startup messages
+            responses = []
+            timeout = time.time() + 0.5
+            while time.time() < timeout:
+                try:
+                    line = serial._outgoing.get_nowait()
+                    responses.append(line.strip())
+                except queue.Empty:
+                    break
+
+            # Should have empty line and "start"
+            self.assertIn("start", responses)
+            # Should NOT have eager FIRMWARE_NAME or Cap: lines
+            cap_lines = [r for r in responses if r.startswith("Cap:")]
+            fw_lines = [r for r in responses if r.startswith("FIRMWARE_NAME:")]
+            self.assertEqual(len(cap_lines), 0, f"Should not send Cap: at boot, got {cap_lines}")
+            self.assertEqual(len(fw_lines), 0, f"Should not send FIRMWARE_NAME at boot, got {fw_lines}")
+        finally:
+            serial._poll_stop.set()
+            serial.close()
+
+
 if __name__ == "__main__":
     unittest.main()

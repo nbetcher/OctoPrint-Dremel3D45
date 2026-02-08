@@ -427,9 +427,13 @@ class DremelVirtualSerial:
             return
 
         # Queue initial startup messages (Marlin boot sequence)
+        # NOTE: We only send "start" here. OctoPrint will respond by sending
+        # M110 (line number reset) and M115 (firmware info request). Our M115
+        # handler sends the FIRMWARE_NAME and Cap: lines in response.
+        # Sending capabilities here eagerly causes race conditions with
+        # OctoPrint's M110 reset, leading to "resend request" warnings.
         self._send("")  # Empty line
         self._send("start")
-        self._send("Dremel 3D45 Virtual Serial")
 
         # Try to connect to printer using dremel3dpy library
         try:
@@ -443,11 +447,6 @@ class DremelVirtualSerial:
             # Get firmware version from library
             firmware = self._printer.get_firmware_version() or "Unknown"
             _LOGGER.info("Printer firmware version: %s", firmware)
-
-            # Send capability report (part of Marlin boot sequence)
-            self._send(f"FIRMWARE_NAME:Dremel3D45 FIRMWARE_VERSION:{firmware}")
-            self._send("Cap:AUTOREPORT_TEMP:1")
-            self._send("Cap:AUTOREPORT_SD_STATUS:1")
 
             # Start polling thread
             _LOGGER.debug("Starting poll thread (interval=%ds)", self._poll_interval)
@@ -1358,14 +1357,57 @@ class DremelVirtualSerial:
                 self._printing = printer.is_printing()
                 self._paused = printer.is_paused()
                 is_active = self._printing or self._paused
-                
+
+                # Get job name for external print detection
+                try:
+                    job_name = (printer.get_job_name() or "").strip()
+                except Exception:
+                    job_name = ""
+
+                # Detect externally-started prints (started from touchscreen/USB)
+                # When the printer transitions from idle to printing without
+                # OctoPrint having sent M23/M24, we emit "File opened:" /
+                # "File selected" so OctoPrint's comm module creates a
+                # PrintingSdFileInformation and can auto-detect the SD print.
+                if is_active and not self._was_printing:
+                    _LOGGER.info(
+                        "Print started (external detection): job=%s",
+                        job_name or "(unknown)",
+                    )
+                    # Sync job name into selected file tracking
+                    if job_name:
+                        self._selected_file_remote = job_name
+                        # Check if this was one of our uploads
+                        display_name = ""
+                        for disp, meta in self._sd_index.items():
+                            if (meta.get("remote") or "").lower() == job_name.lower():
+                                display_name = meta.get("display") or disp
+                                self._selected_file_size = int(meta.get("size") or 0)
+                                break
+                        self._selected_file_display = display_name or job_name
+                    elif not self._selected_file_display:
+                        self._selected_file_display = "print.gcode"
+                        self._selected_file_remote = "print.gcode"
+
+                    # Tell OctoPrint a file is selected so it can enter
+                    # the SD printing state when it sees progress bytes.
+                    file_display = self._selected_file_display or "print.gcode"
+                    file_size = int(self._selected_file_size or 0)
+                    self._send(f"File opened: {file_display} Size: {file_size}")
+                    self._send("File selected")
+
                 # Detect print completion: was printing/paused, now idle
-                if self._was_printing and not is_active:
+                elif self._was_printing and not is_active:
                     _LOGGER.info("Print completed")
+                    # Send final 100% progress so OctoPrint marks print done
+                    total = int(self._selected_file_size or 100)
+                    self._send(f"SD printing byte {total}/{total}")
+                    # Then report not printing so OctoPrint transitions out
+                    self._send("Not SD printing")
                     self._selected_file_display = ""
                     self._selected_file_remote = ""
                     self._selected_file_size = 0
-                
+
                 self._was_printing = is_active
                 
                 self._progress = float(printer.get_printing_progress() or 0)
@@ -1389,10 +1431,6 @@ class DremelVirtualSerial:
                 self._connection_errors = 0
 
                 # Best-effort: keep selected file in sync with the active job name
-                try:
-                    job_name = (printer.get_job_name() or "").strip()
-                except Exception:
-                    job_name = ""
                 if (self._printing or self._paused) and job_name:
                     self._selected_file_remote = job_name
                     # If we previously uploaded this via OctoPrint, map back to display name
@@ -1486,8 +1524,17 @@ class DremelVirtualSerial:
                 # Auto-report SD status if enabled
                 if self._autosd_enabled and self._autosd_interval > 0:
                     if (now - self._last_autosd_ts) >= float(self._autosd_interval):
-                        printed = int(self._progress)
-                        self._send(f"SD printing byte {printed}/100")
+                        if self._printing or self._paused:
+                            total = int(self._selected_file_size or 0)
+                            if total > 0:
+                                printed = int((float(self._progress) / 100.0) * float(total))
+                                self._send(f"SD printing byte {printed}/{total}")
+                            else:
+                                # No file size known — use progress as 0-100 byte scale
+                                printed = int(self._progress)
+                                self._send(f"SD printing byte {printed}/100")
+                        else:
+                            self._send("Not SD printing")
                         self._last_autosd_ts = now
                     
             except Exception as e:
