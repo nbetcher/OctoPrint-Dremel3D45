@@ -266,12 +266,17 @@ class TestGCodeHandlers(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_m115_reports_firmware(self):
-        """M115 should report firmware info."""
+        """M115 should report firmware info with standard Marlin fields."""
         responses = self._send_command("M115")
 
         response_text = " ".join(responses)
         self.assertIn("FIRMWARE_NAME:Dremel3D45", response_text)
-        self.assertIn("AUTOREPORT_TEMP", response_text)
+        self.assertIn("PROTOCOL_VERSION:1.0", response_text)
+        self.assertIn("EXTRUDER_COUNT:1", response_text)
+        self.assertIn("Cap:SDCARD:1", responses)
+        self.assertIn("Cap:AUTOREPORT_TEMP:1", responses)
+        self.assertIn("Cap:CHAMBER_TEMPERATURE:1", responses)
+        self.assertIn("Cap:BUILD_PERCENT:1", responses)
         self.assertIn("ok", responses)
 
     def test_m119_reports_endstops(self):
@@ -311,6 +316,68 @@ class TestGCodeHandlers(unittest.TestCase):
         responses = self._send_command(cmd)
 
         self.assertTrue(any("checksum" in r.lower() for r in responses))
+
+    def test_m110_resets_line_number_from_zero(self):
+        """M110 N0 should reset line numbering even when _expected_line is non-zero.
+
+        Reproduces the real OctoPrint boot scenario: OctoPrint sends
+        'N0 M110 N0*125' at the start of every print to reset the line
+        counter.  If the virtual serial has already seen numbered lines
+        (e.g. from a previous print), _expected_line will be >0 and the
+        command would be rejected without an M110 exemption.
+        """
+        # Establish line numbering at N1 → _expected_line becomes 2
+        self._send_command("N1 M105")
+        self.assertEqual(self.serial._expected_line, 2)
+
+        # Now send the exact command OctoPrint sends at print start
+        # Checksum: XOR("N0 M110 N0") = 125
+        responses = self._send_command("N0 M110 N0*125")
+
+        # Should succeed (ok), NOT produce a line number error
+        self.assertIn("ok", responses)
+        self.assertFalse(any("Error" in r for r in responses))
+        # _expected_line should now be 1 (reset to 0, then +1)
+        self.assertEqual(self.serial._expected_line, 1)
+        self.assertEqual(self.serial._current_line, 0)
+
+    def test_m110_resets_line_number_without_checksum(self):
+        """M110 N0 without checksum should also be accepted."""
+        # Establish at N5 → _expected_line becomes 6
+        self.serial._expected_line = 5
+        self.serial._current_line = 4
+        self._send_command("N5 M105")
+        self.assertEqual(self.serial._expected_line, 6)
+
+        # Send M110 N0 without checksum
+        responses = self._send_command("N0 M110 N0")
+
+        self.assertIn("ok", responses)
+        self.assertFalse(any("Error" in r for r in responses))
+        self.assertEqual(self.serial._expected_line, 1)
+
+    def test_m110_resets_to_nonzero_line(self):
+        """M110 N42 should reset line numbering to 42."""
+        self.serial._expected_line = 10
+        self.serial._current_line = 9
+
+        responses = self._send_command("N42 M110 N42")
+
+        self.assertIn("ok", responses)
+        self.assertFalse(any("Error" in r for r in responses))
+        self.assertEqual(self.serial._current_line, 42)
+        self.assertEqual(self.serial._expected_line, 43)
+
+    def test_wrong_line_number_still_rejected_for_non_m110(self):
+        """Non-M110 commands with wrong line numbers should still be rejected."""
+        # Set expected to 5
+        self.serial._expected_line = 5
+        self.serial._current_line = 4
+
+        responses = self._send_command("N10 M105")
+
+        self.assertTrue(any("Error" in r for r in responses))
+        self.assertTrue(any("Resend: 5" in r for r in responses))
 
     # -------------------------------------------------------------------------
     # Comment Stripping
@@ -1228,7 +1295,7 @@ class TestBootSequence(unittest.TestCase):
 
     @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
     def test_boot_does_not_send_capabilities(self, mock_printer_class):
-        """Boot should only send empty line + start, NOT FIRMWARE_NAME or Cap:."""
+        """Boot should only send empty line + start + SD card ok, NOT FIRMWARE_NAME or Cap:."""
         mock_printer = MagicMock()
         mock_printer.get_firmware_version.return_value = "1.0.0"
         mock_printer.is_printing.return_value = False
@@ -1258,8 +1325,9 @@ class TestBootSequence(unittest.TestCase):
                 except queue.Empty:
                     break
 
-            # Should have empty line and "start"
+            # Should have empty line, "start", and "SD card ok"
             self.assertIn("start", responses)
+            self.assertIn("SD card ok", responses)
             # Should NOT have eager FIRMWARE_NAME or Cap: lines
             cap_lines = [r for r in responses if r.startswith("Cap:")]
             fw_lines = [r for r in responses if r.startswith("FIRMWARE_NAME:")]

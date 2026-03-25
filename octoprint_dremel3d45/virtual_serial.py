@@ -483,13 +483,17 @@ class DremelVirtualSerial:
             return
 
         # Queue initial startup messages (Marlin boot sequence)
-        # NOTE: We only send "start" here. OctoPrint will respond by sending
-        # M110 (line number reset) and M115 (firmware info request). Our M115
-        # handler sends the FIRMWARE_NAME and Cap: lines in response.
-        # Sending capabilities here eagerly causes race conditions with
-        # OctoPrint's M110 reset, leading to "resend request" warnings.
+        # NOTE: We only send "start" + "SD card ok" here. OctoPrint will
+        # respond by sending M110 (line number reset) and M115 (firmware info
+        # request). Our M115 handler sends the FIRMWARE_NAME and Cap: lines
+        # in response.  Sending capabilities here eagerly causes race
+        # conditions with OctoPrint's M110 reset, leading to "resend request"
+        # warnings.
+        # "SD card ok" is required for OctoPrint to enable SD card features,
+        # which are essential since this plugin simulates SD card printing.
         self._send("")  # Empty line
         self._send("start")
+        self._send("SD card ok")
 
         # Try to connect to printer using dremel3dpy library
         try:
@@ -602,25 +606,40 @@ class DremelVirtualSerial:
                     computed,
                     raw_line,
                 )
-                self._send("Error:checksum mismatch")
+                self._send(
+                    f"Error:checksum mismatch, Last Line: {self._current_line or 0}"
+                )
                 if line_number is not None:
-                    self._send(f"Resend:{line_number}")
+                    self._send(f"Resend: {line_number}")
                 return
 
-        # Line number sequencing (best-effort, only if host uses N-lines)
+        # Peek at the command *before* the sequence check so we can
+        # recognise M110 (set line number).  Marlin exempts M110 from the
+        # sequence check because its entire purpose is to reset the counter.
+        peek_command = line_for_checksum
+        if match:
+            peek_command = peek_command[match.end():]
+        peek_command = self._strip_comments(peek_command)
+        is_m110 = peek_command.split()[0].upper() == "M110" if peek_command.split() else False
+
+        # Line number sequencing (best-effort, only if host uses N-lines).
+        # M110 is exempt — it resets the expected line counter.
         if line_number is not None:
-            if self._expected_line is None:
+            if is_m110:
+                # M110 resets the line numbering; accept whatever N-value
+                # the host provides and skip the sequence check.
                 self._expected_line = line_number
-            if line_number != self._expected_line:
-                self._send("Error:Line Number is not Last Line Number+1")
-                self._send(f"Resend:{self._expected_line}")
+            elif self._expected_line is None:
+                self._expected_line = line_number
+            elif line_number != self._expected_line:
+                self._send(
+                    f"Error:Line Number is not Last Line Number+1, Last Line: {self._current_line or 0}"
+                )
+                self._send(f"Resend: {self._expected_line}")
                 return
 
         # Remove line number + checksum, then strip comments
-        command = line_for_checksum
-        if match:
-            command = command[match.end():]
-        command = self._strip_comments(command)
+        command = peek_command
 
         # Track the most recent line number seen (best-effort)
         if line_number is not None:
@@ -696,13 +715,24 @@ class DremelVirtualSerial:
         )
         
         # Include UUID for plugin compatibility
-        self._send(f"FIRMWARE_NAME:Dremel3D45 MACHINE_TYPE:{machine} FIRMWARE_VERSION:{firmware} SERIAL:{serial} UUID:{serial}")
+        self._send(
+            f"FIRMWARE_NAME:Dremel3D45 {firmware}"
+            f" PROTOCOL_VERSION:1.0"
+            f" MACHINE_TYPE:{machine}"
+            f" EXTRUDER_COUNT:1"
+            f" UUID:{serial}"
+        )
+        self._send("Cap:SDCARD:1")
         self._send("Cap:AUTOREPORT_TEMP:1")
         self._send("Cap:AUTOREPORT_SD_STATUS:1")
+        self._send("Cap:AUTOREPORT_POS:0")
         self._send("Cap:EEPROM:0")
         self._send("Cap:VOLUMETRIC:0")
-        self._send("Cap:THERMAL_PROTECTION:0")
+        self._send("Cap:THERMAL_PROTECTION:1")
+        self._send("Cap:CHAMBER_TEMPERATURE:1")
+        self._send("Cap:BUILD_PERCENT:1")
         self._send("Cap:EMERGENCY_PARSER:0")
+        self._send("Cap:LFN_WRITE:0")
         self._send("ok")
 
     def _gcode_M114(self, command: str) -> None:
@@ -1237,7 +1267,8 @@ class DremelVirtualSerial:
         self._send("ok")
 
     def _gcode_M21(self, command: str) -> None:
-        """Initialize SD card (no-op)."""
+        """Initialize SD card (Marlin: responds with SD card availability)."""
+        self._send("SD card ok")
         self._send("ok")
 
     def _gcode_M22(self, command: str) -> None:
@@ -1756,8 +1787,10 @@ class DremelVirtualSerial:
                     if interval <= 0 or (now - self._last_autotemp_ts) >= float(interval):
                         t0 = self._temps.get("tool0", (0, 0))
                         bed = self._temps.get("bed", (0, 0))
+                        chamber = self._temps.get("chamber", (0, 0))
                         self._send(
                             f"T:{t0[0]:.1f} /{t0[1]:.1f} B:{bed[0]:.1f} /{bed[1]:.1f}"
+                            f" C:{chamber[0]:.1f} /{chamber[1]:.1f}"
                         )
                         self._last_autotemp_ts = now
 
