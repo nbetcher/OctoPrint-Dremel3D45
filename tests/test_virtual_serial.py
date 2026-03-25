@@ -760,7 +760,18 @@ class TestTemperatureControl(unittest.TestCase):
         self.serial._paused = False
         responses = self._send_command("M104 S200")
         self.assertTrue(any("Error" in r for r in responses))
+        self.assertIn("ok", responses)
         mock_request.assert_not_called()
+
+    @patch("octoprint_dremel3d45.virtual_serial.default_request")
+    def test_m104_request_failure_reports_error_without_ok(self, mock_request):
+        """M104 should return Error and still acknowledge with ok when backend fails."""
+        mock_request.side_effect = RuntimeError("backend failure")
+
+        responses = self._send_command("M104 S200")
+
+        self.assertTrue(any("Error:" in r for r in responses))
+        self.assertIn("ok", responses)
 
     @patch("octoprint_dremel3d45.virtual_serial.default_request")
     def test_m104_allowed_when_paused(self, mock_request):
@@ -886,6 +897,7 @@ class TestM24StartPrint(unittest.TestCase):
         responses = self._send_command("M24")
 
         self.assertTrue(any("Error" in r for r in responses))
+        self.assertIn("ok", responses)
 
     def test_m24_resume_clears_paused(self):
         """M24 when paused should resume and clear _paused."""
@@ -971,6 +983,78 @@ class TestUploadFile(unittest.TestCase):
         self.serial._printer = None
         result = self.serial.upload_file("/tmp/fake.gcode", "test.gcode")
         self.assertFalse(result)
+
+
+class TestStopFailureHandling(unittest.TestCase):
+    """Test stop command failure paths for M524/M112."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        mock_printer_class.return_value = self.mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+
+        self.serial = DremelVirtualSerial(
+            settings=MockSettings(),
+            read_timeout=1.0,
+            data_folder=None,
+        )
+        self._drain()
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain(self):
+        responses = []
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                line = self.serial._outgoing.get_nowait()
+                responses.append(line.strip())
+            except queue.Empty:
+                break
+        return responses
+
+    def _send_command(self, command):
+        self.serial.write(f"{command}\n".encode())
+        time.sleep(0.05)
+        return self._drain()
+
+    def test_m524_stop_failure_reports_error_without_ok(self):
+        """M524 stop failures should still acknowledge with ok."""
+        self.serial._printing = True
+        self.mock_printer.stop_print.side_effect = RuntimeError("stop failed")
+
+        responses = self._send_command("M524")
+
+        self.assertTrue(any("Error:" in r for r in responses))
+        self.assertIn("ok", responses)
+
+    def test_m112_stop_failure_reports_error_without_ok(self):
+        """M112 stop failures should still acknowledge with ok."""
+        self.serial._printing = True
+        self.mock_printer.stop_print.side_effect = RuntimeError("stop failed")
+
+        responses = self._send_command("M112")
+
+        self.assertTrue(any("Error:" in r for r in responses))
+        self.assertIn("ok", responses)
 
 
 class TestPollLoopBehavior(unittest.TestCase):
@@ -1073,6 +1157,72 @@ class TestPollLoopBehavior(unittest.TestCase):
         self.assertEqual(len(sd_lines), 0)
 
 
+class TestRefreshFailureRecovery(unittest.TestCase):
+    """Test behavior after repeated refresh failures."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        mock_printer_class.return_value = self.mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+
+        self.serial = DremelVirtualSerial(
+            settings=MockSettings(),
+            read_timeout=1.0,
+            data_folder=None,
+        )
+        self._drain()
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain(self):
+        responses = []
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                line = self.serial._outgoing.get_nowait()
+                responses.append(line.strip())
+            except queue.Empty:
+                break
+        return responses
+
+    def test_repeated_refresh_failures_clear_stale_print_state(self):
+        self.serial._printing = True
+        self.serial._paused = False
+        self.serial._was_printing = True
+        self.serial._job_phase = "building"
+
+        self.mock_printer.set_job_status.side_effect = RuntimeError("offline")
+
+        for _ in range(4):
+            self.serial._refresh_status()
+
+        responses = self._drain()
+
+        self.assertFalse(self.serial._printing)
+        self.assertFalse(self.serial._paused)
+        self.assertFalse(self.serial._was_printing)
+        self.assertEqual(self.serial._job_phase, "idle")
+        self.assertIn("Not SD printing", responses)
+
+
 class TestBootSequence(unittest.TestCase):
     """Test that boot sequence is minimal (no eager capabilities)."""
 
@@ -1118,6 +1268,370 @@ class TestBootSequence(unittest.TestCase):
         finally:
             serial._poll_stop.set()
             serial.close()
+
+
+class TestResilientApiParsing(unittest.TestCase):
+    """Test that the vendored dremel3dpy library handles missing keys gracefully."""
+
+    def _make_printer(self):
+        """Create a bare Dremel3DPrinter without __init__ (no real connection)."""
+        from octoprint_dremel3d45.vendor.dremel3dpy import Dremel3DPrinter
+
+        printer = object.__new__(Dremel3DPrinter)
+        printer._host = "192.168.1.100"
+        printer._job_status = None
+        printer._printer_info = None
+        printer._printer_extra_stats = None
+        printer._total_time = 0
+        printer._is_printing = False
+        printer._is_building = False
+        printer._is_calibrating = False
+        printer._is_starting = False
+        printer._is_heating = False
+        printer._is_finished = False
+        return printer
+
+    def _mock_post_empty(self):
+        """Return a patch context for requests.post returning empty JSON."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        return patch("requests.post", return_value=mock_resp)
+
+    def test_set_job_status_missing_keys(self):
+        """set_job_status should not raise when API returns partial data."""
+        printer = self._make_printer()
+
+        with self._mock_post_empty():
+            printer.set_job_status(refresh=True)
+
+        # All getters should return safe defaults
+        self.assertEqual(printer.get_printing_progress(), 0)
+        self.assertIsNotNone(printer.get_printing_status())
+
+    def test_set_printer_info_missing_keys(self):
+        """set_printer_info should not raise when API returns partial data."""
+        printer = self._make_printer()
+
+        with self._mock_post_empty():
+            printer.set_printer_info(refresh=True)
+
+        self.assertIsNotNone(printer.get_title())
+        self.assertIsNotNone(printer.get_firmware_version())
+
+    def test_set_extra_status_missing_keys(self):
+        """set_extra_status should not raise when API returns partial data."""
+        printer = self._make_printer()
+
+        with self._mock_post_empty():
+            printer.set_extra_status(refresh=True)
+
+    def test_set_job_status_maps_paused_phase(self):
+        """Raw paused status should map to paused (not unknown)."""
+        from octoprint_dremel3d45.vendor.dremel3dpy.helpers.constants import JOB_STATUS
+
+        printer = self._make_printer()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = ('{"%s": "paused"}' % JOB_STATUS[0]).encode("utf-8")
+
+        with patch("requests.post", return_value=mock_resp):
+            printer.set_job_status(refresh=True)
+
+        self.assertEqual(printer.get_printing_status(), "paused")
+
+
+class TestDefaultRequestHandling(unittest.TestCase):
+    """Regression tests for default_request error behavior."""
+
+    def test_default_request_non_200_raises_runtimeerror(self):
+        from octoprint_dremel3d45.vendor.dremel3dpy import default_request
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.content = b'{"message":"boom"}'
+        mock_resp.text = '{"message":"boom"}'
+
+        with patch("requests.post", return_value=mock_resp):
+            with self.assertRaises(RuntimeError):
+                default_request("192.168.1.100", "GETPRINTERSTATUS")
+
+    def test_default_request_non_json_error_body_raises_runtimeerror(self):
+        from octoprint_dremel3d45.vendor.dremel3dpy import default_request
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 502
+        mock_resp.headers = {"Content-Type": "text/html"}
+        mock_resp.content = b"<html>bad gateway</html>"
+        mock_resp.text = "bad gateway"
+
+        with patch("requests.post", return_value=mock_resp):
+            with self.assertRaises(RuntimeError):
+                default_request("192.168.1.100", "GETPRINTERSTATUS")
+
+    def test_default_request_http_200_with_api_error_code_raises_runtimeerror(self):
+        from octoprint_dremel3d45.vendor.dremel3dpy import default_request
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.content = b'{"error_code":500,"message":"command failed"}'
+        mock_resp.text = '{"error_code":500,"message":"command failed"}'
+
+        with patch("requests.post", return_value=mock_resp):
+            with self.assertRaises(RuntimeError):
+                default_request("192.168.1.100", "PRINT=test.gcode")
+
+    def test_default_request_http_200_with_api_success_code_returns_payload(self):
+        from octoprint_dremel3d45.vendor.dremel3dpy import default_request
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.content = b'{"error_code":200,"message":"ok"}'
+        mock_resp.text = '{"error_code":200,"message":"ok"}'
+
+        with patch("requests.post", return_value=mock_resp):
+            payload = default_request("192.168.1.100", "PRINT=test.gcode")
+
+        self.assertEqual(payload.get("error_code"), 200)
+
+
+class TestRefreshCallsAllEndpoints(unittest.TestCase):
+    """Test that _refresh_status calls all three API endpoints."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        self.mock_printer.get_job_status.return_value = {}
+        self.mock_printer.is_door_open.return_value = False
+        mock_printer_class.return_value = self.mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+
+        settings = MockSettings()
+        self.serial = DremelVirtualSerial(settings=settings, read_timeout=1.0, data_folder=None)
+        self._drain_responses()
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain_responses(self):
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                self.serial._outgoing.get_nowait()
+            except queue.Empty:
+                break
+
+    def test_refresh_calls_all_three_api_methods(self):
+        """_refresh_status should call set_job_status, set_printer_info, and set_extra_status."""
+        self.serial._refresh_status()
+
+        self.mock_printer.set_job_status.assert_called_with(refresh=True)
+        self.mock_printer.set_printer_info.assert_called_with(refresh=True)
+        self.mock_printer.set_extra_status.assert_called_with(refresh=True)
+
+    def test_refresh_continues_if_printer_info_fails(self):
+        """_refresh_status should not crash if set_printer_info raises."""
+        self.mock_printer.set_printer_info.side_effect = Exception("API timeout")
+
+        # Should not raise
+        self.serial._refresh_status()
+
+        # set_job_status should still have been called
+        self.mock_printer.set_job_status.assert_called_with(refresh=True)
+
+    def test_refresh_continues_if_extra_status_fails(self):
+        """_refresh_status should not crash if set_extra_status raises."""
+        self.mock_printer.set_extra_status.side_effect = Exception("HTTPS error")
+
+        # Should not raise
+        self.serial._refresh_status()
+
+        self.mock_printer.set_job_status.assert_called_with(refresh=True)
+
+
+class TestExtensionAgnosticLookup(unittest.TestCase):
+    """Test that SD index lookups work across .gcode extension differences."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        mock_printer_class.return_value = self.mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+
+        settings = MockSettings()
+        self.serial = DremelVirtualSerial(settings=settings, read_timeout=1.0, data_folder=None)
+        self._drain_responses()
+
+        # Seed the SD index with a file that has .gcode in its remote name
+        self.serial._sd_index = {
+            "benchy.gcode": {
+                "display": "benchy.gcode",
+                "remote": "benchy.gcode",
+                "size": 12345,
+            }
+        }
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain_responses(self):
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                self.serial._outgoing.get_nowait()
+            except queue.Empty:
+                break
+
+    def test_lookup_exact_match(self):
+        """Should find file when job name matches remote exactly."""
+        result = self.serial._lookup_sd_index_by_job_name("benchy.gcode")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "benchy.gcode")
+        self.assertEqual(result[2], 12345)
+
+    def test_lookup_without_extension(self):
+        """Should find 'benchy.gcode' in SD index when job name is 'benchy' (no extension)."""
+        result = self.serial._lookup_sd_index_by_job_name("benchy")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "benchy.gcode")
+
+    def test_lookup_case_insensitive(self):
+        """Lookup should be case-insensitive."""
+        result = self.serial._lookup_sd_index_by_job_name("BENCHY")
+        self.assertIsNotNone(result)
+
+    def test_lookup_no_match(self):
+        """Should return None when job name doesn't match anything."""
+        result = self.serial._lookup_sd_index_by_job_name("cube")
+        self.assertIsNone(result)
+
+    def test_strip_gcode_ext(self):
+        """_strip_gcode_ext should remove .gcode/.gco/.g extensions."""
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+
+        self.assertEqual(DremelVirtualSerial._strip_gcode_ext("file.gcode"), "file")
+        self.assertEqual(DremelVirtualSerial._strip_gcode_ext("file.gco"), "file")
+        self.assertEqual(DremelVirtualSerial._strip_gcode_ext("file.g"), "file")
+        self.assertEqual(DremelVirtualSerial._strip_gcode_ext("file.stl"), "file.stl")
+        self.assertEqual(DremelVirtualSerial._strip_gcode_ext("FILE.GCODE"), "FILE")
+        self.assertEqual(DremelVirtualSerial._strip_gcode_ext(""), "")
+
+
+class TestUpdateSettings(unittest.TestCase):
+    """Test that update_settings propagates settings to a running session."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        mock_printer_class.return_value = self.mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+
+        self.settings = MockSettings()
+        self.serial = DremelVirtualSerial(settings=self.settings, read_timeout=1.0, data_folder=None)
+        self._drain_responses()
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain_responses(self):
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                self.serial._outgoing.get_nowait()
+            except queue.Empty:
+                break
+
+    def test_update_poll_interval(self):
+        """Changing poll_interval in settings should update the serial's interval."""
+        self.assertEqual(self.serial._poll_interval, 60)
+
+        # Simulate user changing the poll interval
+        self.settings._data["poll_interval"] = 5
+        self.serial.update_settings()
+
+        self.assertEqual(self.serial._poll_interval, 5)
+
+    def test_update_request_timeout(self):
+        """Changing request_timeout should update both the serial and the library constant."""
+        self.assertEqual(self.serial._request_timeout, 30)
+
+        self.settings._data["request_timeout"] = 15
+        self.serial.update_settings()
+
+        self.assertEqual(self.serial._request_timeout, 15)
+
+        from octoprint_dremel3d45.vendor import dremel3dpy as _dremel3dpy
+        from octoprint_dremel3d45.vendor.dremel3dpy.helpers import constants as _c
+        self.assertEqual(_c.REQUEST_TIMEOUT, 15)
+        self.assertEqual(_dremel3dpy.REQUEST_TIMEOUT, 15)
+
+    def test_no_change_is_noop(self):
+        """update_settings should be a no-op when values haven't changed."""
+        old_interval = self.serial._poll_interval
+        old_timeout = self.serial._request_timeout
+
+        self.serial.update_settings()
+
+        self.assertEqual(self.serial._poll_interval, old_interval)
+        self.assertEqual(self.serial._request_timeout, old_timeout)
+
+    def test_update_poll_interval_clamps_to_minimum_one(self):
+        """poll_interval values <= 0 should be clamped to 1 second."""
+        self.settings._data["poll_interval"] = 0
+        self.serial.update_settings()
+        self.assertEqual(self.serial._poll_interval, 1)
 
 
 if __name__ == "__main__":

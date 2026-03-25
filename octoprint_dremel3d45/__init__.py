@@ -163,6 +163,13 @@ if _OCTOPRINT_AVAILABLE:
                 self._settings.get(["poll_interval"]),
             )
 
+            # Propagate mutable settings to the running virtual serial session
+            if self._virtual_serial:
+                try:
+                    self._virtual_serial.update_settings()
+                except Exception as e:
+                    _LOGGER.warning("Failed to propagate settings to virtual serial: %s", e)
+
             if self._settings.get_boolean(["camera_enabled"]) and self._settings.get_boolean(
                 ["camera_update_global"]
             ):
@@ -172,7 +179,11 @@ if _OCTOPRINT_AVAILABLE:
             return diff
 
         def _configure_camera(self) -> None:
-            """Configure OctoPrint's webcam settings for Dremel camera."""
+            """Configure OctoPrint's webcam settings for Dremel camera.
+
+            Supports both the modern classicwebcam plugin (OctoPrint 1.9+)
+            and the legacy top-level webcam settings path for older versions.
+            """
             printer_ip = self._settings.get(["printer_ip"])
             if not printer_ip:
                 _LOGGER.debug("Cannot configure camera: no printer IP set")
@@ -191,16 +202,27 @@ if _OCTOPRINT_AVAILABLE:
             _LOGGER.info("Configuring global webcam settings: stream=%s, snapshot=%s", stream_url, snapshot_url)
 
             try:
-                from octoprint.settings import settings as octoprint_settings
+                # OctoPrint 1.9+ moved webcam settings into the classicwebcam plugin
+                webcam_plugin = self._plugin_manager.get_plugin_info("classicwebcam", require_enabled=True)
+                if webcam_plugin and webcam_plugin.implementation:
+                    impl = webcam_plugin.implementation
+                    impl._settings.set(["stream"], stream_url)
+                    impl._settings.set(["snapshot"], snapshot_url)
+                    impl._settings.set(["streamRatio"], "4:3")
+                    impl._settings.save()
+                    _LOGGER.info("Updated classicwebcam plugin settings")
+                else:
+                    # Fallback: legacy OctoPrint webcam path (< 1.9)
+                    from octoprint.settings import settings as octoprint_settings
 
-                s = octoprint_settings()
-                s.set(["webcam", "stream"], stream_url)
-                s.set(["webcam", "snapshot"], snapshot_url)
-                s.set(["webcam", "streamRatio"], "4:3")
-                s.save()
-                _LOGGER.info("Global webcam settings updated successfully")
+                    s = octoprint_settings()
+                    s.set(["webcam", "stream"], stream_url)
+                    s.set(["webcam", "snapshot"], snapshot_url)
+                    s.set(["webcam", "streamRatio"], "4:3")
+                    s.save()
+                    _LOGGER.info("Updated legacy webcam settings (classicwebcam plugin not available)")
             except Exception as e:
-                _LOGGER.warning("Failed to update global webcam settings: %s", e)
+                _LOGGER.warning("Failed to update webcam settings: %s", e)
 
         def _handle_test_connection(self):
             """Test connection to Dremel printer and return status."""
@@ -212,10 +234,13 @@ if _OCTOPRINT_AVAILABLE:
 
             _LOGGER.info("Testing connection to %s", printer_ip)
             try:
+                from .vendor import dremel3dpy as _dremel3dpy
                 from .vendor.dremel3dpy import Dremel3DPrinter
                 from .vendor.dremel3dpy.helpers import constants as _c
 
-                _c.REQUEST_TIMEOUT = self._settings.get_int(["request_timeout"]) or 30
+                timeout = self._settings.get_int(["request_timeout"]) or 30
+                _c.REQUEST_TIMEOUT = timeout
+                _dremel3dpy.REQUEST_TIMEOUT = timeout
 
                 printer = Dremel3DPrinter(printer_ip)
                 printer.set_printer_info(refresh=True)
@@ -316,8 +341,15 @@ if _OCTOPRINT_AVAILABLE:
                 except Exception:
                     sd_index = {"count": 0, "items": []}
 
+            connected = False
+            if self._virtual_serial:
+                try:
+                    connected = bool(self._virtual_serial.is_open)
+                except Exception:
+                    connected = False
+
             return jsonify(
-                connected=bool(self._virtual_serial is not None),
+                connected=connected,
                 sd_index=sd_index,
             )
 
@@ -429,9 +461,20 @@ if _OCTOPRINT_AVAILABLE:
 
             Called to get additional port names to show in the connection dropdown.
             """
-            # Always show the port - if IP is not configured, user will see
-            # an error when they try to connect (handled in virtual_serial_factory)
-            _LOGGER.debug("get_additional_port_names hook called - returning [%s]", DREMEL_PORT_NAME)
+            # Only advertise the virtual port when an IP is configured.
+            # This avoids OctoPrint autodetect repeatedly trying/"failing"
+            # a synthetic serial port before the plugin is configured.
+            printer_ip = (self._settings.get(["printer_ip"]) or "").strip()
+            if not printer_ip:
+                _LOGGER.debug(
+                    "get_additional_port_names hook called - no printer IP configured, returning []"
+                )
+                return []
+
+            _LOGGER.debug(
+                "get_additional_port_names hook called - returning [%s]",
+                DREMEL_PORT_NAME,
+            )
             return [DREMEL_PORT_NAME]
 
         # -------------------------------------------------------------------------
@@ -457,6 +500,20 @@ if _OCTOPRINT_AVAILABLE:
             """
             if not self._virtual_serial:
                 _LOGGER.error("SD upload failed: not connected to Dremel printer")
+                sd_upload_failed(
+                    filename, path, "Not connected to Dremel printer"
+                )
+                return
+
+            try:
+                if not bool(self._virtual_serial.is_open):
+                    _LOGGER.error("SD upload failed: virtual serial session is closed")
+                    sd_upload_failed(
+                        filename, path, "Not connected to Dremel printer"
+                    )
+                    return
+            except Exception:
+                _LOGGER.error("SD upload failed: virtual serial session state unavailable")
                 sd_upload_failed(
                     filename, path, "Not connected to Dremel printer"
                 )

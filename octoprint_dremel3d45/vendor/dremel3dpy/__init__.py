@@ -49,6 +49,7 @@ from .helpers.constants import (
     DREMEL_MANUFACTURER,
     ELAPSED_TIME,
     ERROR_CODE,
+    ERROR_CODE,
     ESTIMATED_TOTAL_TIME,
     EXTRA_STATUS_PORT,
     EXTRUDER_TARGET_TEMPERATURE,
@@ -110,34 +111,34 @@ class Dremel3DPrinter:
             else:
                 title = None
                 model = None
+                machine_type = printer_info.get(CONF_MACHINE_TYPE, "Dremel 3D45")
                 try:
                     title = re.search(
-                        r"DREMEL [^\s+]+", printer_info[CONF_MACHINE_TYPE]
+                        r"DREMEL [^\s+]+", machine_type
                     ).group(0)
                 except Exception:
-                    title = printer_info.get(CONF_MACHINE_TYPE, "Dremel 3D45")
+                    title = machine_type
                 try:
                     model = re.search(
-                        r"DREMEL ([^\s+]+)", printer_info[CONF_MACHINE_TYPE]
+                        r"DREMEL ([^\s+]+)", machine_type
                     ).group(1)
                 except Exception:
                     model = "3D45"
+                is_eth = printer_info.get(CONF_ETHERNET_CONNECTED) == 1
                 self._printer_info = {
                     CONF_HOST: self._host,
-                    CONF_API_VERSION: printer_info[CONF_API_VERSION],
-                    CONF_CONNECTION_TYPE: "eth0"
-                    if printer_info[CONF_ETHERNET_CONNECTED] == 1
-                    else "wlan",
-                    CONF_ETHERNET_IP: printer_info[CONF_ETHERNET_IP]
-                    if printer_info[CONF_ETHERNET_CONNECTED] == 1
+                    CONF_API_VERSION: printer_info.get(CONF_API_VERSION, ""),
+                    CONF_CONNECTION_TYPE: "eth0" if is_eth else "wlan",
+                    CONF_ETHERNET_IP: printer_info.get(CONF_ETHERNET_IP, "n-a")
+                    if is_eth
                     else "n-a",
-                    CONF_FIRMWARE_VERSION: printer_info[CONF_FIRMWARE_VERSION],
-                    CONF_MACHINE_TYPE: printer_info[CONF_MACHINE_TYPE],
+                    CONF_FIRMWARE_VERSION: printer_info.get(CONF_FIRMWARE_VERSION, "Unknown"),
+                    CONF_MACHINE_TYPE: machine_type,
                     CONF_MODEL: model,
-                    CONF_SERIAL_NUMBER: printer_info[CONF_SERIAL_NUMBER],
+                    CONF_SERIAL_NUMBER: printer_info.get(CONF_SERIAL_NUMBER, "Unknown"),
                     CONF_TITLE: title,
-                    CONF_WIFI_IP: printer_info[CONF_WIFI_IP]
-                    if printer_info[CONF_WIFI_CONNECTED] == 1
+                    CONF_WIFI_IP: printer_info.get(CONF_WIFI_IP, "n-a")
+                    if printer_info.get(CONF_WIFI_CONNECTED) == 1
                     else "n-a",
                 }
 
@@ -151,9 +152,11 @@ class Dremel3DPrinter:
                     else "idle"
                 )
                 job_status = default_request(self._host, PRINTER_STATUS_COMMAND)
-                job_name = re.search(
-                    r"(.*?)(\.[^\.]*)?$", job_status[JOB_NAME[0]]
-                ).group(1)
+                raw_job_name = job_status.get(JOB_NAME[0], "")
+                job_name_match = re.search(
+                    r"(.*?)(\.[^\.]*)?$", raw_job_name
+                )
+                job_name = job_name_match.group(1) if job_name_match else raw_job_name
             except RuntimeError as exc:
                 self._job_status = None
                 raise exc
@@ -163,35 +166,39 @@ class Dremel3DPrinter:
                     "abort": "abort",
                     "building": "building",
                     "completed": "completed",
+                    "paused": "paused",
                     "pausing": "pausing",
                     "preparing": "preparing",
+                    "resuming": "resuming",
                     "!pausing": "paused",
                     "!resuming": "resuming",
                 }
+                # Use .get() with sensible defaults for ALL fields so that
+                # a missing key in the API response does not crash the
+                # entire method with a KeyError.
+                raw_job_status = job_status.get(JOB_STATUS[0], "")
                 self._job_status = {
-                    DOOR_OPEN[1]: job_status[DOOR_OPEN[0]],
-                    CHAMBER_TEMPERATURE[1]: job_status[CHAMBER_TEMPERATURE[0]],
-                    ELAPSED_TIME[1]: job_status[ELAPSED_TIME[0]],
-                    REMAINING_TIME[1]: job_status[REMAINING_TIME[0]],
-                    ESTIMATED_TOTAL_TIME[1]: job_status[ESTIMATED_TOTAL_TIME[0]],
-                    EXTRUDER_TEMPERATURE[1]: job_status[EXTRUDER_TEMPERATURE[0]],
-                    EXTRUDER_TARGET_TEMPERATURE[1]: job_status[
-                        EXTRUDER_TARGET_TEMPERATURE[0]
-                    ],
-                    FAN_SPEED[1]: job_status[FAN_SPEED[0]],
-                    FILAMENT[1]: job_status[FILAMENT[0]],
-                    JOB_STATUS[1]: mapped_status[job_status[JOB_STATUS[0]]]
-                    if job_status[JOB_STATUS[0]] in mapped_status
-                    else "unknown",
+                    DOOR_OPEN[1]: job_status.get(DOOR_OPEN[0], 0),
+                    CHAMBER_TEMPERATURE[1]: job_status.get(CHAMBER_TEMPERATURE[0], 0),
+                    ELAPSED_TIME[1]: job_status.get(ELAPSED_TIME[0], 0),
+                    REMAINING_TIME[1]: job_status.get(REMAINING_TIME[0], 0),
+                    ESTIMATED_TOTAL_TIME[1]: job_status.get(ESTIMATED_TOTAL_TIME[0], 0),
+                    EXTRUDER_TEMPERATURE[1]: job_status.get(EXTRUDER_TEMPERATURE[0], 0),
+                    EXTRUDER_TARGET_TEMPERATURE[1]: job_status.get(
+                        EXTRUDER_TARGET_TEMPERATURE[0], 0
+                    ),
+                    FAN_SPEED[1]: job_status.get(FAN_SPEED[0], 0),
+                    FILAMENT[1]: job_status.get(FILAMENT[0], ""),
+                    JOB_STATUS[1]: mapped_status.get(raw_job_status, "unknown"),
                     JOB_NAME[1]: job_name,
                     LAYER[1]: job_status.get(LAYER[0], 0),
-                    NETWORK_BUILD[1]: job_status[NETWORK_BUILD[0]],
-                    PLATFORM_TARGET_TEMPERATURE[1]: job_status[
-                        PLATFORM_TARGET_TEMPERATURE[0]
-                    ],
-                    PLATFORM_TEMPERATURE[1]: job_status[PLATFORM_TEMPERATURE[0]],
-                    PROGRESS[1]: job_status[PROGRESS[0]],
-                    STATUS[1]: job_status[STATUS[0]],
+                    NETWORK_BUILD[1]: job_status.get(NETWORK_BUILD[0], 0),
+                    PLATFORM_TARGET_TEMPERATURE[1]: job_status.get(
+                        PLATFORM_TARGET_TEMPERATURE[0], 0
+                    ),
+                    PLATFORM_TEMPERATURE[1]: job_status.get(PLATFORM_TEMPERATURE[0], 0),
+                    PROGRESS[1]: job_status.get(PROGRESS[0], 0),
+                    STATUS[1]: job_status.get(STATUS[0], ""),
                 }
                 current_printing_status = self.get_printing_status()
                 if last_printing_status != current_printing_status:
@@ -269,17 +276,29 @@ class Dremel3DPrinter:
                 self._printer_extra_stats = None
                 raise exc
             else:
-                max_platform_temperature = re.search(
-                    r"0-(\d+)", extra_status[PLATFORM_TEMPERATURE_RANGE[0]]
-                ).group(1)
-                max_extruder_temperature = re.search(
-                    r"0-(\d+)", extra_status[EXTRUDER_TEMPERATURE_RANGE[0]]
-                ).group(1)
+                max_platform_temperature = 0
+                max_extruder_temperature = 0
+                try:
+                    m = re.search(
+                        r"0-(\d+)", extra_status.get(PLATFORM_TEMPERATURE_RANGE[0], "")
+                    )
+                    if m:
+                        max_platform_temperature = m.group(1)
+                except Exception:
+                    pass
+                try:
+                    m = re.search(
+                        r"0-(\d+)", extra_status.get(EXTRUDER_TEMPERATURE_RANGE[0], "")
+                    )
+                    if m:
+                        max_extruder_temperature = m.group(1)
+                except Exception:
+                    pass
                 self._printer_extra_stats = {
-                    AVAILABLE_STORAGE[1]: extra_status[AVAILABLE_STORAGE[0]],
+                    AVAILABLE_STORAGE[1]: extra_status.get(AVAILABLE_STORAGE[0], ""),
                     EXTRUDER_TEMPERATURE_RANGE[1]: max_extruder_temperature,
                     PLATFORM_TEMPERATURE_RANGE[1]: max_platform_temperature,
-                    USAGE_COUNTER[1]: extra_status[USAGE_COUNTER[0]],
+                    USAGE_COUNTER[1]: extra_status.get(USAGE_COUNTER[0], 0),
                 }
 
     def refresh(self) -> None:
@@ -540,18 +559,44 @@ def default_request(
     netloc = f"{host}:{port}" if port else str(host)
     url = urlunsplit((scheme, netloc, path, "", ""))
 
-    response = requests.post(url, data=command, timeout=REQUEST_TIMEOUT, verify=False)
-
-    response_json = json.loads(response.content.decode("utf-8"))
-    if response.status_code != 200:
-        raise RuntimeError(
-            {
-                f"HTTP {response.status_code}",
-                {
-                    "content-type": response.headers.get("Content-Type"),
-                    "message": response_json["message"],
-                    "status-code": response.status_code,
-                },
-            }
+    try:
+        # IMPORTANT: Dremel printer HTTPS endpoints commonly use invalid/expired
+        # certificates in the field. DO NOT enable certificate verification for
+        # printer API calls, or connectivity will fail for many real devices.
+        response = requests.post(
+            url, data=command, timeout=REQUEST_TIMEOUT, verify=False
         )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Request failed for {url}: {exc}") from exc
+
+    response_json: Dict[str, Any] = {}
+    try:
+        payload = response.content.decode("utf-8")
+        parsed = json.loads(payload)
+        if isinstance(parsed, dict):
+            response_json = parsed
+    except Exception:
+        response_json = {}
+
+    if response.status_code != 200:
+        message = response_json.get("message") or response.text[:200]
+        raise RuntimeError(
+            f"HTTP {response.status_code} from {url} (content-type={response.headers.get('Content-Type')}): {message}"
+        )
+
+    # Dremel command endpoints commonly return HTTP 200 with an API-level
+    # error payload. Treat non-200 API error_code values as failures so callers
+    # do not silently report success.
+    api_error_code = response_json.get(ERROR_CODE)
+    if api_error_code is not None:
+        try:
+            code = int(api_error_code)
+        except (TypeError, ValueError):
+            code = None
+        if code is None or code != 200:
+            message = response_json.get("message") or "Unknown API error"
+            raise RuntimeError(
+                f"Dremel API error from {url}: error_code={api_error_code}, message={message}"
+            )
+
     return response_json

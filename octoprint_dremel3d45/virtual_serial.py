@@ -109,9 +109,14 @@ class DremelVirtualSerial:
         self._host = settings.get(["printer_ip"]) or ""
         self._request_timeout = settings.get_int(["request_timeout"]) or 30
 
-        # Apply configured timeout to vendored library (module-level constant)
+        # Apply configured timeout to vendored library.
+        # dremel3dpy imports REQUEST_TIMEOUT into its module namespace at import
+        # time, so update BOTH the constants module and dremel3dpy module-level
+        # variable to ensure all request sites see the new timeout.
+        from .vendor import dremel3dpy as _dremel3dpy
         from .vendor.dremel3dpy.helpers import constants as _dremel_constants
         _dremel_constants.REQUEST_TIMEOUT = self._request_timeout
+        _dremel3dpy.REQUEST_TIMEOUT = self._request_timeout
 
         _LOGGER.debug("Printer host: %s, request timeout: %ds", self._host, self._request_timeout)
 
@@ -170,7 +175,10 @@ class DremelVirtualSerial:
         # Polling thread for status updates
         self._poll_thread: Optional[threading.Thread] = None
         self._poll_stop = threading.Event()
-        self._poll_interval = settings.get_int(["poll_interval"]) or 10
+        configured_poll = settings.get_int(["poll_interval"])
+        if configured_poll is None:
+            configured_poll = 10
+        self._poll_interval = max(1, int(configured_poll))
 
         _LOGGER.debug("Poll interval: %ds", self._poll_interval)
 
@@ -438,6 +446,30 @@ class DremelVirtualSerial:
         self.reset_input_buffer()
         _LOGGER.info("Virtual serial connection closed")
 
+    def update_settings(self) -> None:
+        """Re-read mutable settings from OctoPrint and apply them live.
+
+        Called by the plugin's ``on_settings_save`` so that changed values
+        (poll interval, request timeout) take effect without reconnecting.
+        """
+        new_timeout = self._settings.get_int(["request_timeout"]) or 30
+        new_poll = self._settings.get_int(["poll_interval"])
+        if new_poll is None:
+            new_poll = 10
+        new_poll = max(1, int(new_poll))
+
+        if new_timeout != self._request_timeout:
+            _LOGGER.info("Request timeout changed: %ds → %ds", self._request_timeout, new_timeout)
+            self._request_timeout = new_timeout
+            from .vendor import dremel3dpy as _dremel3dpy
+            from .vendor.dremel3dpy.helpers import constants as _dremel_constants
+            _dremel_constants.REQUEST_TIMEOUT = new_timeout
+            _dremel3dpy.REQUEST_TIMEOUT = new_timeout
+
+        if new_poll != self._poll_interval:
+            _LOGGER.info("Poll interval changed: %ds → %ds", self._poll_interval, new_poll)
+            self._poll_interval = new_poll
+
     # -------------------------------------------------------------------------
     # Startup / Connection
     # -------------------------------------------------------------------------
@@ -489,6 +521,8 @@ class DremelVirtualSerial:
 
     def _send(self, line: str) -> None:
         """Queue a response line to be read by OctoPrint."""
+        if self._closed:
+            return
         payload = line + "\n"
         with self._lock:
             self._outgoing_bytes += len(payload)
@@ -885,8 +919,14 @@ class DremelVirtualSerial:
         _LOGGER.info("Aborting print (M524)")
         printer = self._printer
         if printer:
-            printer.stop_print()
-            _LOGGER.debug("Stop command sent to printer")
+            try:
+                printer.stop_print()
+                _LOGGER.debug("Stop command sent to printer")
+            except Exception as e:
+                _LOGGER.error("Failed to stop print on M524: %s", e)
+                self._send(f"Error: {e}")
+                self._send("ok")
+                return
         self._printing = False
         self._paused = False
         self._selected_file_display = ""
@@ -955,6 +995,9 @@ class DremelVirtualSerial:
                 _LOGGER.debug("Extruder temperature target set successfully")
             except Exception as e:
                 _LOGGER.error("Failed to set nozzle temperature: %s", e)
+                self._send(f"Error: {e}")
+                self._send("ok")
+                return
         self._send("ok")
 
     def _gcode_M140(self, command: str) -> None:
@@ -995,6 +1038,9 @@ class DremelVirtualSerial:
                 _LOGGER.debug("Bed temperature target set successfully")
             except Exception as e:
                 _LOGGER.error("Failed to set bed temperature: %s", e)
+                self._send(f"Error: {e}")
+                self._send("ok")
+                return
         self._send("ok")
 
     def _gcode_M109(self, command: str) -> None:
@@ -1028,6 +1074,9 @@ class DremelVirtualSerial:
                 _LOGGER.debug("Extruder temperature target set - OctoPrint will wait for target")
             except Exception as e:
                 _LOGGER.error("Failed to set nozzle temperature: %s", e)
+                self._send(f"Error: {e}")
+                self._send("ok")
+                return
         self._send("ok")
 
     def _gcode_M190(self, command: str) -> None:
@@ -1058,6 +1107,9 @@ class DremelVirtualSerial:
                 _LOGGER.debug("Bed temperature target set - OctoPrint will wait for target")
             except Exception as e:
                 _LOGGER.error("Failed to set bed temperature: %s", e)
+                self._send(f"Error: {e}")
+                self._send("ok")
+                return
         self._send("ok")
 
     def _gcode_M106(self, command: str) -> None:
@@ -1126,7 +1178,13 @@ class DremelVirtualSerial:
         printer = self._printer
         if printer:
             _LOGGER.info("Sending stop command to printer")
-            printer.stop_print()
+            try:
+                printer.stop_print()
+            except Exception as e:
+                _LOGGER.error("Failed to stop print on M112: %s", e)
+                self._send(f"Error: {e}")
+                self._send("ok")
+                return
         self._printing = False
         self._paused = False
         self._selected_file_display = ""
@@ -1372,16 +1430,77 @@ class DremelVirtualSerial:
     # Dremel API Communication (via dremel3dpy library)
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _strip_gcode_ext(name: str) -> str:
+        """Strip .gcode / .g / .gco extension for comparison purposes.
+
+        The dremel3dpy library's ``get_job_name()`` strips file extensions,
+        but our SD index stores the remote filename WITH the extension
+        (e.g. ``"abcde.gcode"``).  This helper normalises both sides so
+        lookups succeed regardless of whether an extension is present.
+        """
+        if not name:
+            return ""
+        lower = name.lower()
+        for ext in (".gcode", ".gco", ".g"):
+            if lower.endswith(ext):
+                return name[: len(name) - len(ext)]
+        return name
+
+    def _lookup_sd_index_by_job_name(self, job_name: str) -> tuple[str, str, int] | None:
+        """Find an SD index entry matching *job_name* (extension-agnostic).
+
+        Returns ``(display_name, remote_name, size)`` or ``None``.
+        """
+        if not job_name:
+            return None
+        stripped = self._strip_gcode_ext(job_name).lower()
+        for disp, meta in self._sd_index.items():
+            remote = meta.get("remote") or ""
+            if self._strip_gcode_ext(remote).lower() == stripped:
+                return (
+                    meta.get("display") or disp,
+                    remote,
+                    int(meta.get("size") or 0),
+                )
+        return None
+
     def _refresh_status(self) -> None:
         """Refresh printer status from Dremel API via library."""
+        if self._closed:
+            return
+
         # Grab reference under lock to avoid race with close()
         printer = self._printer
         if not printer:
             return
 
         try:
-            # Refresh job status from library (makes ONE API call internally)
-            printer.set_job_status(refresh=True)
+            # Refresh all data sources from the Dremel API, matching the
+            # pattern used by the Home Assistant integration which calls
+            # printer.refresh().  We call each individually so a failure
+            # in one (e.g. set_extra_status on HTTPS) doesn't block the
+            # others from updating.
+            try:
+                printer.set_job_status(refresh=True)
+            except Exception as e:
+                _LOGGER.debug("set_job_status failed: %s", e)
+                raise  # temperatures etc. depend on this; abort cycle
+
+            # Printer info changes rarely; refresh it periodically so
+            # firmware version / serial stay accurate.  Errors are non-
+            # fatal — cached data is used.
+            try:
+                printer.set_printer_info(refresh=True)
+            except Exception as e:
+                _LOGGER.debug("set_printer_info failed (non-fatal): %s", e)
+
+            # Extra status (max temps, storage) via HTTPS port 11134.
+            # Also non-fatal — cached or zero values are acceptable.
+            try:
+                printer.set_extra_status(refresh=True)
+            except Exception as e:
+                _LOGGER.debug("set_extra_status failed (non-fatal): %s", e)
 
             with self._lock:
                 # Get temperatures from API
@@ -1438,13 +1557,13 @@ class DremelVirtualSerial:
                     if job_name:
                         self._selected_file_remote = job_name
                         # Check if this was one of our uploads
-                        display_name = ""
-                        for disp, meta in self._sd_index.items():
-                            if (meta.get("remote") or "").lower() == job_name.lower():
-                                display_name = meta.get("display") or disp
-                                self._selected_file_size = int(meta.get("size") or 0)
-                                break
-                        self._selected_file_display = display_name or job_name
+                        match = self._lookup_sd_index_by_job_name(job_name)
+                        if match:
+                            display_name, _, file_size = match
+                            self._selected_file_display = display_name
+                            self._selected_file_size = file_size
+                        else:
+                            self._selected_file_display = job_name
                     elif not self._selected_file_display:
                         self._selected_file_display = "unknown_job.gcode"
                         self._selected_file_remote = "unknown_job.gcode"
@@ -1478,13 +1597,13 @@ class DremelVirtualSerial:
                             job_name, self._last_announced_job_name,
                         )
                         self._selected_file_remote = job_name
-                        display_name = ""
-                        for disp, meta in self._sd_index.items():
-                            if (meta.get("remote") or "").lower() == job_name.lower():
-                                display_name = meta.get("display") or disp
-                                self._selected_file_size = int(meta.get("size") or 0)
-                                break
-                        self._selected_file_display = display_name or job_name
+                        match = self._lookup_sd_index_by_job_name(job_name)
+                        if match:
+                            display_name, _, file_size = match
+                            self._selected_file_display = display_name
+                            self._selected_file_size = file_size
+                        else:
+                            self._selected_file_display = job_name
                         if not self._selected_file_size:
                             self._selected_file_size = self._SYNTHETIC_FILE_SIZE
 
@@ -1547,14 +1666,10 @@ class DremelVirtualSerial:
                 # Best-effort: keep selected file in sync with the active job name
                 if is_active and job_name:
                     self._selected_file_remote = job_name
-                    display_name = ""
-                    for disp, meta in self._sd_index.items():
-                        if (meta.get("remote") or "").lower() == job_name.lower():
-                            display_name = meta.get("display") or disp
-                            self._selected_file_size = int(meta.get("size") or 0)
-                            break
-                    if display_name:
-                        self._selected_file_display = display_name
+                    match = self._lookup_sd_index_by_job_name(job_name)
+                    if match:
+                        self._selected_file_display = match[0]
+                        self._selected_file_size = match[2]
 
         except Exception as e:
             self._connection_errors += 1
@@ -1562,6 +1677,15 @@ class DremelVirtualSerial:
                 _LOGGER.warning("Error refreshing status (attempt %d): %s", self._connection_errors, e)
             elif self._connection_errors == 4:
                 _LOGGER.error("Persistent connection errors - printer may be offline")
+                # Prevent stale "printing" state when backend status can no
+                # longer be refreshed for multiple cycles.
+                with self._lock:
+                    if self._was_printing or self._printing or self._paused:
+                        self._send("Not SD printing")
+                    self._printing = False
+                    self._paused = False
+                    self._was_printing = False
+                    self._job_phase = "idle"
             # After 3 errors, only log at debug level to avoid log spam
             else:
                 _LOGGER.debug("Error refreshing status: %s", e)
@@ -1617,6 +1741,8 @@ class DremelVirtualSerial:
         _LOGGER.info("Starting status polling thread")
 
         while not self._poll_stop.wait(self._poll_interval):
+            if self._closed:
+                break
             try:
                 self._refresh_status()
 
@@ -1683,7 +1809,11 @@ class DremelVirtualSerial:
             True if upload succeeded
         """
         _LOGGER.info("Upload requested: %s -> %s", local_path, remote_name)
-        
+
+        if self._closed:
+            _LOGGER.error("Cannot upload: connection is closed")
+            return False
+
         printer = self._printer
         if not printer:
             _LOGGER.error("Cannot upload: not connected to printer")
@@ -1694,21 +1824,17 @@ class DremelVirtualSerial:
             return False
             
         try:
-            _LOGGER.debug("Reading file content from: %s", local_path)
-            # Read as binary to avoid corrupting gcode files with
-            # non-UTF-8 bytes (e.g., binary thumbnails from PrusaSlicer)
-            with open(local_path, "rb") as f:
-                file_content = f.read()
-
             try:
                 file_size = int(os.path.getsize(local_path))
                 _LOGGER.debug("File size: %d bytes", file_size)
             except Exception:
                 file_size = 0
             
-            # Use the library's internal upload method
-            _LOGGER.debug("Uploading file content to printer...")
-            uploaded_name = printer._upload_print(file_content)
+            # Stream file content to the printer to avoid high memory usage
+            # on low-resource hosts (e.g., Raspberry Pi).
+            _LOGGER.debug("Uploading file stream to printer: %s", local_path)
+            with open(local_path, "rb") as f:
+                uploaded_name = printer._upload_print(f)
             _LOGGER.info(
                 "File uploaded successfully: %s -> %s (size=%d bytes)",
                 local_path, uploaded_name, file_size,
