@@ -11,6 +11,7 @@ virtual serial transport pattern (like the bundled virtual_printer plugin).
 Hooks used:
     - octoprint.comm.transport.serial.factory
     - octoprint.comm.transport.serial.additional_port_names
+    - octoprint.printer.estimation.remaining
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ _LOGGER = logging.getLogger("octoprint.plugins.dremel3d45")
 
 __plugin_name__ = "Dremel 3D45"
 __plugin_pythoncompat__ = ">=3.7,<4"
-__plugin_version__ = "0.1.1"
+__plugin_version__ = "1.0.0"
 __plugin_author__ = "Nick Betcher"
 __plugin_author_email__ = "nick@nickbetcher.com"
 __plugin_url__ = "https://www.nickbetcher.com/projects/octoprint_dremel3d45"
@@ -390,6 +391,35 @@ if _OCTOPRINT_AVAILABLE:
             return jsonify(ok=True)
 
         # -------------------------------------------------------------------------
+        # Print Time Estimation Hook
+        # -------------------------------------------------------------------------
+
+        def estimate_remaining_print_time(
+            self,
+            origin,
+            filename,
+            progress,
+            printTime,
+            cleanedPrintTime,
+            statisticalTotalPrintTime,
+            statisticalTotalPrintTimeType,
+        ):
+            """
+            Hook: octoprint.printer.estimation.remaining
+
+            Provides the Dremel API's remaining-time estimate directly to
+            OctoPrint's print time estimator.  This supplements the M73
+            progress report we send over the serial line.
+            """
+            if (
+                self._virtual_serial
+                and getattr(self._virtual_serial, "_printing", False)
+                and self._virtual_serial._remaining_time > 0
+            ):
+                return self._virtual_serial._remaining_time, "dremel"
+            return None
+
+        # -------------------------------------------------------------------------
         # Virtual Serial Factory Hook
         # -------------------------------------------------------------------------
 
@@ -561,6 +591,8 @@ def __plugin_load__():
         "octoprint.comm.transport.serial.additional_port_names": plugin.get_additional_port_names,
         # SD card upload hook
         "octoprint.printer.sdcardupload": plugin.sdcard_upload_hook,
+        # Print time estimation from Dremel API
+        "octoprint.printer.estimation.remaining": plugin.estimate_remaining_print_time,
     }
 
     _LOGGER.info(

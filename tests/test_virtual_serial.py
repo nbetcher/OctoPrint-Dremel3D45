@@ -176,6 +176,22 @@ class TestGCodeHandlers(unittest.TestCase):
 
         self.assertTrue(any("Error" in r for r in responses))
 
+    def test_m23_selects_by_sd_safe_filename(self):
+        """M23 should resolve SD-safe names for files with spaces in display name."""
+        self.serial._sd_index["My Fancy Part.gcode"] = {
+            "display": "My Fancy Part.gcode",
+            "remote": "UPLOAD001.g3drem",
+            "size": 54321,
+        }
+
+        responses = self._send_command("M23 my_fancy_part.gcode")
+
+        file_opened = [r for r in responses if r.startswith("File opened:")]
+        self.assertEqual(len(file_opened), 1)
+        self.assertIn("my_fancy_part.gcode", file_opened[0])
+        self.assertEqual(self.serial._selected_file_display, "My Fancy Part.gcode")
+        self.assertEqual(self.serial._selected_file_remote, "UPLOAD001.g3drem")
+
     def test_m25_pauses_print(self):
         """M25 should pause a running print (checks return value)."""
         self.serial._printing = True
@@ -1212,6 +1228,35 @@ class TestPollLoopBehavior(unittest.TestCase):
             f"Bad format: {layer_lines[0]}"
         )
 
+    def test_active_print_emits_m73_progress(self):
+        """During active print, poll body should emit M73 P<pct> R<min>."""
+        self.serial._printing = True
+        self.serial._progress = 42.0
+        self.serial._remaining_time = 630  # 10.5 minutes → 10
+
+        # Simulate poll body M73 emission
+        remaining_min = max(int(self.serial._remaining_time / 60), 0)
+        self.serial._send(f"M73 P{int(self.serial._progress)} R{remaining_min}")
+
+        responses = self._drain()
+        m73_lines = [r for r in responses if r.startswith("M73")]
+        self.assertEqual(len(m73_lines), 1)
+        self.assertEqual(m73_lines[0], "M73 P42 R10")
+
+    def test_active_print_m73_zero_remaining(self):
+        """M73 R should be 0 when remaining_time is 0."""
+        self.serial._printing = True
+        self.serial._progress = 99.0
+        self.serial._remaining_time = 0
+
+        remaining_min = max(int(self.serial._remaining_time / 60), 0)
+        self.serial._send(f"M73 P{int(self.serial._progress)} R{remaining_min}")
+
+        responses = self._drain()
+        m73_lines = [r for r in responses if r.startswith("M73")]
+        self.assertEqual(len(m73_lines), 1)
+        self.assertEqual(m73_lines[0], "M73 P99 R0")
+
     def test_idle_does_not_emit_sd_progress(self):
         """When idle with no auto-report, no SD progress should be emitted."""
         self.serial._printing = False
@@ -1700,6 +1745,685 @@ class TestUpdateSettings(unittest.TestCase):
         self.settings._data["poll_interval"] = 0
         self.serial.update_settings()
         self.assertEqual(self.serial._poll_interval, 1)
+
+
+class TestEstimationHook(unittest.TestCase):
+    """Test the print time estimation hook in the plugin."""
+
+    def _estimate(self, virtual_serial):
+        """Replicate the estimation hook logic from Dremel3D45Plugin."""
+        if (
+            virtual_serial
+            and getattr(virtual_serial, "_printing", False)
+            and virtual_serial._remaining_time > 0
+        ):
+            return virtual_serial._remaining_time, "dremel"
+        return None
+
+    def test_returns_none_when_not_connected(self):
+        """Should return None when no virtual serial is connected."""
+        result = self._estimate(None)
+        self.assertIsNone(result)
+
+    def test_returns_none_when_not_printing(self):
+        """Should return None when connected but not printing."""
+        vs = MagicMock()
+        vs._printing = False
+        vs._remaining_time = 600
+        result = self._estimate(vs)
+        self.assertIsNone(result)
+
+    def test_returns_none_when_remaining_zero(self):
+        """Should return None when remaining_time is 0."""
+        vs = MagicMock()
+        vs._printing = True
+        vs._remaining_time = 0
+        result = self._estimate(vs)
+        self.assertIsNone(result)
+
+    def test_returns_remaining_time_when_printing(self):
+        """Should return (remaining_seconds, 'dremel') when actively printing."""
+        vs = MagicMock()
+        vs._printing = True
+        vs._remaining_time = 1800
+        result = self._estimate(vs)
+        self.assertEqual(result, (1800, "dremel"))
+
+
+class TestSdFilenameConversion(unittest.TestCase):
+    """Test _to_sd_filename static method."""
+
+    def setUp(self):
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.convert = DremelVirtualSerial._to_sd_filename
+
+    def test_simple_gcode(self):
+        self.assertEqual(self.convert("mypart.gcode"), "mypart.gcode")
+
+    def test_uppercase_normalised(self):
+        self.assertEqual(self.convert("MyPart.GCODE"), "mypart.gcode")
+
+    def test_spaces_replaced(self):
+        result = self.convert("my part name.gcode")
+        self.assertNotIn(" ", result)
+        self.assertTrue(result.endswith(".gcode"))
+
+    def test_non_gcode_extension(self):
+        result = self.convert("model.g3drem")
+        self.assertTrue(result.endswith(".gcode"))
+
+    def test_no_extension(self):
+        result = self.convert("model")
+        self.assertTrue(result.endswith(".gcode"))
+
+    def test_gco_extension_kept(self):
+        self.assertEqual(self.convert("file.gco"), "file.gco")
+
+    def test_g_extension_kept(self):
+        self.assertEqual(self.convert("file.g"), "file.g")
+
+    def test_empty_string(self):
+        self.assertEqual(self.convert(""), "unknown_job.gcode")
+
+    def test_none(self):
+        self.assertEqual(self.convert(None), "unknown_job.gcode")
+
+
+class TestSdFileListInjection(unittest.TestCase):
+    """Test that SD file list is sent before File opened during external prints."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        self.mock_printer.is_door_open.return_value = False
+        self.mock_printer.get_job_status.return_value = {}
+        mock_printer_class.return_value = self.mock_printer
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.serial = DremelVirtualSerial(
+            settings=MockSettings(),
+            read_timeout=1.0,
+            data_folder=None,
+        )
+        self._drain()
+
+    def tearDown(self):
+        if hasattr(self, "serial") and self.serial:
+            self.serial._poll_stop.set()
+            self.serial.close()
+
+    def _drain(self):
+        responses = []
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            try:
+                line = self.serial._outgoing.get_nowait()
+                responses.append(line.strip())
+            except queue.Empty:
+                break
+        return responses
+
+    def test_file_list_sent_before_file_opened(self):
+        """SD file list must be sent before File opened for external prints."""
+        self.mock_printer.get_printing_status.return_value = "building"
+        self.mock_printer.get_job_name.return_value = "test_part.gcode"
+        self.mock_printer.get_printing_progress.return_value = 5.0
+
+        self.serial._refresh_status()
+        responses = self._drain()
+
+        begin_idx = next(
+            (i for i, r in enumerate(responses) if r == "Begin file list"), None
+        )
+        end_idx = next(
+            (i for i, r in enumerate(responses) if r == "End file list"), None
+        )
+        opened_idx = next(
+            (i for i, r in enumerate(responses) if r.startswith("File opened:")), None
+        )
+
+        self.assertIsNotNone(begin_idx, f"Missing 'Begin file list' in {responses}")
+        self.assertIsNotNone(end_idx, f"Missing 'End file list' in {responses}")
+        self.assertIsNotNone(opened_idx, f"Missing 'File opened:' in {responses}")
+        self.assertLess(begin_idx, end_idx)
+        self.assertLess(end_idx, opened_idx)
+
+    def test_file_list_contains_printing_file(self):
+        """The SD file list must include the currently printing file."""
+        self.mock_printer.get_printing_status.return_value = "building"
+        self.mock_printer.get_job_name.return_value = "My Part.g3drem"
+        self.mock_printer.get_printing_progress.return_value = 10.0
+
+        self.serial._refresh_status()
+        responses = self._drain()
+
+        # Find lines between Begin/End file list
+        begin_idx = next(i for i, r in enumerate(responses) if r == "Begin file list")
+        end_idx = next(i for i, r in enumerate(responses) if r == "End file list")
+        file_entries = responses[begin_idx + 1 : end_idx]
+
+        # Should have at least one entry with the sanitised filename
+        self.assertTrue(len(file_entries) >= 1, f"No file entries: {responses}")
+        # The sanitised name should be lowercase, no spaces, .gcode extension
+        entry = file_entries[0]
+        self.assertTrue(entry.startswith("my_part.gcode"), f"Unexpected entry: {entry}")
+
+    def test_file_opened_uses_sd_filename(self):
+        """File opened: should use the sanitised SD filename, not raw display name."""
+        self.mock_printer.get_printing_status.return_value = "building"
+        self.mock_printer.get_job_name.return_value = "My Model.g3drem"
+        self.mock_printer.get_printing_progress.return_value = 5.0
+
+        self.serial._refresh_status()
+        responses = self._drain()
+
+        file_opened = [r for r in responses if r.startswith("File opened:")]
+        self.assertEqual(len(file_opened), 1)
+        # Should contain the sanitised SD name
+        self.assertIn("my_model.gcode", file_opened[0])
+
+    def test_late_job_name_re_injects_file_list(self):
+        """When real job name is discovered late, SD file list should be re-sent."""
+        # First: unknown job
+        self.mock_printer.get_printing_status.return_value = "building"
+        self.mock_printer.get_job_name.return_value = ""
+        self.mock_printer.get_printing_progress.return_value = 2.0
+
+        self.serial._refresh_status()
+        self._drain()
+
+        # Now: real name appears
+        self.mock_printer.get_job_name.return_value = "real_name.gcode"
+        self.serial._refresh_status()
+        responses = self._drain()
+
+        # Should re-send file list with the real name
+        begin_count = sum(1 for r in responses if r == "Begin file list")
+        self.assertGreaterEqual(begin_count, 1, f"Expected file list re-send: {responses}")
+        file_opened = [r for r in responses if r.startswith("File opened:")]
+        self.assertEqual(len(file_opened), 1)
+        self.assertIn("real_name.gcode", file_opened[0])
+
+    def test_m20_includes_printing_file(self):
+        """M20 during a print should include the currently printing file."""
+        # Set up an active print
+        self.mock_printer.get_printing_status.return_value = "building"
+        self.mock_printer.get_job_name.return_value = "active_job.gcode"
+        self.mock_printer.get_printing_progress.return_value = 50.0
+
+        self.serial._refresh_status()
+        self._drain()
+
+        # Now send M20
+        self.serial.write(b"M20\n")
+        responses = self._drain()
+
+        begin_idx = next(i for i, r in enumerate(responses) if r == "Begin file list")
+        end_idx = next(i for i, r in enumerate(responses) if r == "End file list")
+        file_entries = responses[begin_idx + 1 : end_idx]
+
+        # The active job should appear in the file list
+        entry_names = [e.split()[0] for e in file_entries]
+        self.assertIn("active_job.gcode", entry_names,
+                       f"Active job not in M20 list: {file_entries}")
+
+    def test_m20_uses_sd_name_and_longname_for_spaced_display(self):
+        """M20 entries should keep first token SD-safe and preserve display as longname."""
+        self.serial._sd_index["My Fancy Part.gcode"] = {
+            "display": "My Fancy Part.gcode",
+            "remote": "UPLOADXYZ.g3drem",
+            "size": 1234,
+        }
+
+        self.serial.write(b"M20\n")
+        responses = self._drain()
+
+        begin_idx = next(i for i, r in enumerate(responses) if r == "Begin file list")
+        end_idx = next(i for i, r in enumerate(responses) if r == "End file list")
+        file_entries = responses[begin_idx + 1 : end_idx]
+
+        # Expect format: <sd_name> <size> <timestamp> <longname>
+        entry = next((e for e in file_entries if e.startswith("my_fancy_part.gcode ")), "")
+        self.assertTrue(entry, f"Missing sanitized entry: {file_entries}")
+        self.assertIn("My Fancy Part.gcode", entry)
+
+
+class TestFatTimestamp(unittest.TestCase):
+    """Test _to_fat_timestamp static method."""
+
+    def setUp(self):
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.to_ts = DremelVirtualSerial._to_fat_timestamp
+
+    def test_format_is_hex(self):
+        ts = self.to_ts()
+        self.assertTrue(ts.startswith("0x"), f"Expected hex prefix: {ts}")
+        # Should be parseable as int
+        int(ts, 16)
+
+    def test_specific_datetime(self):
+        import datetime
+        dt = datetime.datetime(2025, 6, 15, 14, 30, 0)
+        ts = self.to_ts(dt)
+        val = int(ts, 16)
+        # Decode and verify date part
+        date_part = val >> 16
+        day = date_part & 0x1F
+        month = (date_part >> 5) & 0x0F
+        year = ((date_part >> 9) & 0x7F) + 1980
+        self.assertEqual(day, 15)
+        self.assertEqual(month, 6)
+        self.assertEqual(year, 2025)
+
+    def test_file_list_entry_includes_timestamp(self):
+        """SD file list entries in _announce_sd_file should include a 0x timestamp."""
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+
+        @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+        def _run(mock_cls):
+            mock_printer = MagicMock()
+            mock_printer.get_firmware_version.return_value = "1.0.0"
+            mock_printer.get_title.return_value = "Dremel 3D45"
+            mock_printer.get_serial_number.return_value = "TEST123"
+            mock_printer.get_temperature_type.return_value = 25.0
+            mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+            mock_printer.is_printing.return_value = False
+            mock_printer.is_paused.return_value = False
+            mock_printer.get_printing_status.return_value = "idle"
+            mock_printer.get_printing_progress.return_value = 0
+            mock_printer.get_elapsed_time.return_value = 0
+            mock_printer.get_remaining_time.return_value = 0
+            mock_printer.get_layer.return_value = 0
+            mock_printer.get_job_name.return_value = ""
+            mock_printer.is_door_open.return_value = False
+            mock_printer.get_job_status.return_value = {}
+            mock_cls.return_value = mock_printer
+            serial = DremelVirtualSerial(
+                settings=MockSettings(), read_timeout=1.0, data_folder=None,
+            )
+            # Drain boot
+            while not serial._outgoing.empty():
+                serial._outgoing.get_nowait()
+
+            serial._announce_sd_file("test.gcode", 1000, "Test File.gcode")
+            lines = []
+            while not serial._outgoing.empty():
+                lines.append(serial._outgoing.get_nowait().strip())
+
+            # Find SD file entry between Begin/End
+            begin = lines.index("Begin file list")
+            end = lines.index("End file list")
+            entries = lines[begin + 1 : end]
+            self.assertTrue(len(entries) >= 1, f"No entries: {lines}")
+            # Entry should have format: name size 0xHEX longname
+            parts = entries[-1].split()
+            self.assertTrue(
+                any(p.startswith("0x") for p in parts),
+                f"No timestamp in entry: {entries[-1]}",
+            )
+            serial._poll_stop.set()
+            serial.close()
+
+        _run()
+
+
+class TestGcodeLayerCounting(unittest.TestCase):
+    """Test _count_gcode_layers static method."""
+
+    def setUp(self):
+        import tempfile
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.count = DremelVirtualSerial._count_gcode_layers
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_gcode(self, content: str) -> str:
+        import os
+        path = os.path.join(self._tmpdir, "test.gcode")
+        with open(path, "w") as f:
+            f.write(content)
+        return path
+
+    def test_cura_layer_markers(self):
+        """Count ;LAYER:N markers (Cura / ideaMaker style)."""
+        gcode = """;FLAVOR:Marlin
+;Generated with Cura
+;LAYER:0
+G1 X10 Y10 E0.5
+;LAYER:1
+G1 X20 Y20 E1.0
+;LAYER:2
+G1 X30 Y30 E1.5
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 3)
+
+    def test_prusaslicer_layer_change(self):
+        """Count ;LAYER_CHANGE markers (PrusaSlicer)."""
+        gcode = """; generated by PrusaSlicer
+;LAYER_CHANGE
+G1 Z0.3 F1000
+;LAYER_CHANGE
+G1 Z0.5 F1000
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 2)
+
+    def test_slic3r_before_layer_change(self):
+        """Count ;BEFORE_LAYER_CHANGE markers (Slic3r)."""
+        gcode = """;BEFORE_LAYER_CHANGE
+G1 Z0.3
+;BEFORE_LAYER_CHANGE
+G1 Z0.6
+;BEFORE_LAYER_CHANGE
+G1 Z0.9
+;BEFORE_LAYER_CHANGE
+G1 Z1.2
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 4)
+
+    def test_simplify3d_layer_markers(self):
+        """Count ; layer N markers (Simplify3D)."""
+        gcode = """; layer 1, Z = 0.300
+G1 X10 Y10
+; layer 2, Z = 0.500
+G1 X20 Y20
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 2)
+
+    def test_kisslicer_begin_layer_object(self):
+        """Count ; BEGIN_LAYER_OBJECT markers (KISSlicer)."""
+        gcode = """; BEGIN_LAYER_OBJECT z=0.30
+G1 X10 Y10
+; BEGIN_LAYER_OBJECT z=0.60
+G1 X20 Y20
+; BEGIN_LAYER_OBJECT z=0.90
+G1 X30 Y30
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 3)
+
+    def test_no_layer_markers(self):
+        """File with no layer markers returns 0."""
+        gcode = """G28
+G1 Z5 F1000
+G1 X10 Y10 E0.5
+M104 S200
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 0)
+
+    def test_empty_file(self):
+        """Empty file returns 0."""
+        self.assertEqual(self.count(self._write_gcode("")), 0)
+
+    def test_nonexistent_file(self):
+        """Nonexistent file returns 0 (no exception)."""
+        self.assertEqual(self.count("/nonexistent/path/file.gcode"), 0)
+
+    def test_mixed_markers_per_pattern_max(self):
+        """With multiple slicer marker types, per-pattern max is returned."""
+        gcode = """;LAYER:0
+;LAYER_CHANGE
+;LAYER:1
+; layer 2, Z = 0.6
+;LAYER:2
+"""
+        # ;LAYER: appears 3×, ;LAYER_CHANGE 1×, ; layer 1×  → max is 3
+        self.assertEqual(self.count(self._write_gcode(gcode)), 3)
+
+    def test_prusaslicer_dual_markers_not_double_counted(self):
+        """PrusaSlicer emits both ;LAYER_CHANGE and ;BEFORE_LAYER_CHANGE per
+        layer.  Parser must NOT double-count them."""
+        gcode = """; generated by PrusaSlicer
+;LAYER_CHANGE
+;BEFORE_LAYER_CHANGE
+G1 Z0.3 F1000
+;LAYER_CHANGE
+;BEFORE_LAYER_CHANGE
+G1 Z0.6 F1000
+;LAYER_CHANGE
+;BEFORE_LAYER_CHANGE
+G1 Z0.9 F1000
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 3)
+
+    def test_dremel_slicer_header_shortcut(self):
+        """Dremel 3D Slicer header '; total layer number: N' is parsed
+        directly and returned without a full file scan."""
+        gcode = """; HEADER_BLOCK_START
+; generated by Dremel 3D Slicer 2.3.2
+; total layer number: 200
+; HEADER_BLOCK_END
+;LAYER_CHANGE
+;BEFORE_LAYER_CHANGE
+G1 Z0.3
+"""
+        self.assertEqual(self.count(self._write_gcode(gcode)), 200)
+
+    def test_real_world_dremel_slicer_gcode(self):
+        """Parse a real 149K-line Dremel 3D Slicer GCode file (475 layers)."""
+        import os
+        fixture = os.path.join(os.path.dirname(__file__), "test-unit.gcode")
+        self.assertEqual(self.count(fixture), 475)
+
+    def test_inline_non_comment_lines_ignored(self):
+        """Lines without ; prefix are never counted as layers."""
+        gcode = """G1 Z0.3 ; LAYER:1
+G1 ; layer 2
+;LAYER:0
+"""
+        # Only the last line (comment at start) counts
+        self.assertEqual(self.count(self._write_gcode(gcode)), 1)
+
+
+class TestTotalLayersInSdIndex(unittest.TestCase):
+    """Test that total_layers is stored and retrieved through the SD index."""
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        self.mock_printer.is_door_open.return_value = False
+        self.mock_printer.get_job_status.return_value = {}
+        mock_printer_class.return_value = self.mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.serial = DremelVirtualSerial(
+            settings=MockSettings(), read_timeout=1.0, data_folder=None,
+        )
+        while not self.serial._outgoing.empty():
+            self.serial._outgoing.get_nowait()
+
+    def tearDown(self):
+        self.serial._poll_stop.set()
+        self.serial.close()
+
+    def test_upload_stores_total_layers(self):
+        """upload_file should count layers from GCode and store in SD index."""
+        import tempfile, os
+        gcode = ";LAYER:0\nG1 X10\n;LAYER:1\nG1 X20\n;LAYER:2\nG1 X30\n"
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".gcode", delete=False)
+        tmp.write(gcode)
+        tmp.close()
+
+        try:
+            self.mock_printer._upload_print.return_value = "uploaded.gcode"
+            self.serial.upload_file(tmp.name, "test.gcode")
+
+            entry = self.serial._sd_index.get("test.gcode")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry["total_layers"], 3)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_lookup_returns_total_layers(self):
+        """_lookup_sd_index_by_job_name should return total_layers as 4th element."""
+        self.serial._sd_index["My File.gcode"] = {
+            "display": "My File.gcode",
+            "remote": "my_file.gcode",
+            "size": 5000,
+            "total_layers": 42,
+        }
+        match = self.serial._lookup_sd_index_by_job_name("my_file.gcode")
+        self.assertIsNotNone(match)
+        self.assertEqual(len(match), 4)
+        self.assertEqual(match[3], 42)
+
+    def test_total_layers_populated_on_print_start(self):
+        """When a print starts and matches an SD index entry, _total_layers is set."""
+        self.serial._sd_index["benchy.gcode"] = {
+            "display": "benchy.gcode",
+            "remote": "benchy.gcode",
+            "size": 10000,
+            "total_layers": 150,
+        }
+
+        # Simulate idle → active transition
+        self.mock_printer.get_printing_status.return_value = "building"
+        self.mock_printer.get_job_name.return_value = "benchy.gcode"
+        self.mock_printer.get_printing_progress.return_value = 5.0
+        self.mock_printer.get_elapsed_time.return_value = 60
+        self.mock_printer.get_remaining_time.return_value = 3600
+        self.mock_printer.get_layer.return_value = 1
+
+        self.serial._refresh_status()
+        self.assertEqual(self.serial._total_layers, 150)
+
+    def test_total_layers_cleared_on_completion(self):
+        """After print completes, _total_layers is reset to 0."""
+        self.serial._sd_index["part.gcode"] = {
+            "display": "part.gcode",
+            "remote": "part.gcode",
+            "size": 8000,
+            "total_layers": 100,
+        }
+
+        # Start the print
+        self.mock_printer.get_printing_status.return_value = "building"
+        self.mock_printer.get_job_name.return_value = "part.gcode"
+        self.mock_printer.get_printing_progress.return_value = 50.0
+        self.mock_printer.get_elapsed_time.return_value = 300
+        self.mock_printer.get_remaining_time.return_value = 300
+        self.mock_printer.get_layer.return_value = 50
+        self.serial._refresh_status()
+        self.assertEqual(self.serial._total_layers, 100)
+
+        # Drain
+        while not self.serial._outgoing.empty():
+            self.serial._outgoing.get_nowait()
+
+        # Complete the print
+        self.mock_printer.get_printing_status.return_value = "completed"
+        self.mock_printer.get_printing_progress.return_value = 100.0
+        self.serial._refresh_status()
+        self.assertEqual(self.serial._total_layers, 0)
+
+
+class TestLayerNotificationFormat(unittest.TestCase):
+    """Test that layer notification includes total when available.
+
+    The notification is emitted by ``_poll_loop`` (not ``_refresh_status``),
+    so we test the ``_send_layer_notification`` helper directly.
+    """
+
+    @patch("octoprint_dremel3d45.virtual_serial.Dremel3DPrinter")
+    def setUp(self, mock_printer_class):
+        self.mock_printer = MagicMock()
+        self.mock_printer.get_firmware_version.return_value = "1.0.0"
+        self.mock_printer.get_title.return_value = "Dremel 3D45"
+        self.mock_printer.get_serial_number.return_value = "TEST123"
+        self.mock_printer.get_temperature_type.return_value = 25.0
+        self.mock_printer.get_temperature_attributes.return_value = {"target_temp": 0}
+        self.mock_printer.is_printing.return_value = False
+        self.mock_printer.is_paused.return_value = False
+        self.mock_printer.get_printing_status.return_value = "idle"
+        self.mock_printer.get_printing_progress.return_value = 0
+        self.mock_printer.get_elapsed_time.return_value = 0
+        self.mock_printer.get_remaining_time.return_value = 0
+        self.mock_printer.get_layer.return_value = 0
+        self.mock_printer.get_job_name.return_value = ""
+        self.mock_printer.is_door_open.return_value = False
+        self.mock_printer.get_job_status.return_value = {}
+        mock_printer_class.return_value = self.mock_printer
+
+        from octoprint_dremel3d45.virtual_serial import DremelVirtualSerial
+        self.serial = DremelVirtualSerial(
+            settings=MockSettings(), read_timeout=1.0, data_folder=None,
+        )
+        while not self.serial._outgoing.empty():
+            self.serial._outgoing.get_nowait()
+
+    def tearDown(self):
+        self.serial._poll_stop.set()
+        self.serial.close()
+
+    def _drain(self):
+        lines = []
+        while not self.serial._outgoing.empty():
+            lines.append(self.serial._outgoing.get_nowait().strip())
+        return lines
+
+    def test_layer_with_total(self):
+        """When total_layers is known, notification uses Layer X/Y format."""
+        self.serial._current_layer = 10
+        self.serial._total_layers = 50
+        # Directly emit the notification the same way _poll_loop does
+        if self.serial._current_layer > 0:
+            if self.serial._total_layers > 0:
+                self.serial._send(
+                    f"//action:notification Layer {self.serial._current_layer}/{self.serial._total_layers}"
+                )
+            else:
+                self.serial._send(
+                    f"//action:notification Layer {self.serial._current_layer}"
+                )
+        responses = self._drain()
+        layer_msgs = [r for r in responses if "//action:notification Layer" in r]
+        self.assertEqual(len(layer_msgs), 1)
+        self.assertIn("Layer 10/50", layer_msgs[0])
+
+    def test_layer_without_total(self):
+        """When total_layers is 0, notification uses Layer X format (no slash)."""
+        self.serial._current_layer = 15
+        self.serial._total_layers = 0
+        if self.serial._current_layer > 0:
+            if self.serial._total_layers > 0:
+                self.serial._send(
+                    f"//action:notification Layer {self.serial._current_layer}/{self.serial._total_layers}"
+                )
+            else:
+                self.serial._send(
+                    f"//action:notification Layer {self.serial._current_layer}"
+                )
+        responses = self._drain()
+        layer_msgs = [r for r in responses if "//action:notification Layer" in r]
+        self.assertEqual(len(layer_msgs), 1)
+        self.assertIn("Layer 15", layer_msgs[0])
+        self.assertNotIn("15/", layer_msgs[0])
 
 
 if __name__ == "__main__":

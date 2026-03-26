@@ -4,12 +4,19 @@ from setuptools import find_packages, setup
 plugin_identifier = "dremel3d45"
 plugin_package = "octoprint_dremel3d45"
 plugin_name = "OctoPrint-Dremel3D45"
-plugin_version = "0.1.1"
+plugin_version = "1.0.0"
 plugin_description = "Virtual driver for Dremel 3D45 printer over network (REST API)"
 plugin_author = "Nick Betcher"
 plugin_author_email = "nick@nickbetcher.com"
 plugin_url = "https://www.nickbetcher.com/projects/octoprint_dremel3d45"
 plugin_license = "MIT"
+
+# Read long description from README
+try:
+    with open("README.md", "r", encoding="utf-8") as f:
+        plugin_long_description = f.read()
+except FileNotFoundError:
+    plugin_long_description = plugin_description
 
 # We vendor a minimal copy of dremel3dpy inside the plugin package to avoid
 # heavyweight binary dependencies (NumPy/OpenBLAS) on OctoPrint hosts.
@@ -27,6 +34,8 @@ setup(
     name=plugin_name,
     version=plugin_version,
     description=plugin_description,
+    long_description=plugin_long_description,
+    long_description_content_type="text/markdown",
     author=plugin_author,
     author_email=plugin_author_email,
     url=plugin_url,

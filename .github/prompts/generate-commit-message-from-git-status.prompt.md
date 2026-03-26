@@ -1,0 +1,1 @@
+Review all of the changes present in 'git status' and write-up a git commit message on a summary of each change. Then summarize (at the top) the overall "feel" for what this commit is about. Make sure to bullet point each individual change.

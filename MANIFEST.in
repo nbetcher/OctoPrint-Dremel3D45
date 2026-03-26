@@ -1,0 +1,6 @@
+include LICENSE
+include README.md
+include setup.py
+recursive-include octoprint_dremel3d45/templates *.jinja2
+recursive-include octoprint_dremel3d45/static/js *.js
+recursive-include octoprint_dremel3d45/vendor *.py

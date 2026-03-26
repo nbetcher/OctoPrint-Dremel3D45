@@ -44,11 +44,8 @@ The Dremel 3D45 printer has no USB-serial support—all communication happens ov
 git clone https://github.com/yourusername/octoprint-dremel3d45.git
 cd octoprint-dremel3d45
 
-# Install the local patched dremel3dpy library first
-pip install -e ./dremel3dpy-local
-
-# Install the plugin
-pip install -e .
+# Install the plugin (the dremel3dpy library is vendored inside the package)
+pip install .
 
 # Restart OctoPrint
 sudo systemctl restart octoprint
@@ -56,7 +53,11 @@ sudo systemctl restart octoprint
 
 ### Install via OctoPrint Plugin Manager
 
-*(Coming soon - once published to PyPI)*
+Install via the Plugin Manager using this URL:
+
+```
+https://github.com/yourusername/octoprint-dremel3d45/archive/main.zip
+```
 
 ## Configuration
 
@@ -126,7 +127,6 @@ Ensure you're using the plugin's SD card functionality (upload via OctoPrint) ra
 # Set up development environment
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ./dremel3dpy-local
 pip install -e .
 
 # Run tests

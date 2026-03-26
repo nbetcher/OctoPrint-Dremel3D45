@@ -19,6 +19,7 @@ Hooks used:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import json
 import os
@@ -147,11 +148,13 @@ class DremelVirtualSerial:
         self._last_job_phase = "idle"  # Previous job phase for transition detection
         self._completion_sent = False  # One-shot guard for completion messages
         self._last_announced_job_name = ""  # Last job name sent in File opened:
+        self._last_announced_sd_name = ""  # SD-safe filename used in File opened:
         self._progress = 0
         self._progress_from_host = False  # Guard: host-set M73 progress vs API
         self._elapsed_time = 0
         self._remaining_time = 0
         self._current_layer = 0
+        self._total_layers = 0  # Total layers parsed from GCode at upload
         self._connection_errors = 0  # Track consecutive connection errors
         self._filament_type = ""  # Filament type from printer
         self._door_open = False  # Door sensor state
@@ -247,7 +250,14 @@ class DremelVirtualSerial:
                     size = int(meta.get("size") or 0)
                 except Exception:
                     size = 0
-                cleaned[disp] = {"display": disp, "remote": remote, "size": size}
+                try:
+                    total_layers = int(meta.get("total_layers") or 0)
+                except Exception:
+                    total_layers = 0
+                cleaned[disp] = {
+                    "display": disp, "remote": remote,
+                    "size": size, "total_layers": total_layers,
+                }
 
             with self._lock:
                 self._sd_index = cleaned
@@ -543,10 +553,13 @@ class DremelVirtualSerial:
             checksum ^= ord(ch)
         return checksum
 
+    # Pre-compiled pattern for parenthetical GCode comments.
+    _COMMENT_PAREN_RE: re.Pattern[str] = re.compile(r"\([^)]*\)")
+
     def _strip_comments(self, line: str) -> str:
         """Remove common GCode comment styles."""
         # Remove parenthetical comments
-        line = re.sub(r"\([^)]*\)", "", line)
+        line = self._COMMENT_PAREN_RE.sub("", line)
         # Remove ';' comments
         if ";" in line:
             line = line.split(";", 1)[0]
@@ -558,6 +571,135 @@ class DremelVirtualSerial:
         Use this to guard operations that should not occur during printing.
         """
         return self._printing and not self._paused
+
+    @staticmethod
+    def _to_fat_timestamp(dt: datetime.datetime | None = None) -> str:
+        """Encode a datetime as a FAT hex timestamp for M20 file list entries.
+
+        OctoPrint's ``parse_file_list_line`` recognises these as upload dates
+        and forwards them to the frontend's *Uploaded* field.
+        """
+        if dt is None:
+            dt = datetime.datetime.now()
+        date_part = dt.day | (dt.month << 5) | ((dt.year - 1980) << 9)
+        time_part = (dt.second // 2) | (dt.minute << 5) | (dt.hour << 11)
+        return f"0x{(date_part << 16) | time_part:08X}"
+
+    @staticmethod
+    def _to_sd_filename(display_name: str) -> str:
+        """Convert a display name to a valid SD card filename.
+
+        The returned name is lowercase, contains no spaces, and has a
+        ``.gcode`` extension so OctoPrint's file manager recognises it as
+        machinecode.
+        """
+        name = (display_name or "").strip()
+        if not name:
+            return "unknown_job.gcode"
+        base, ext = os.path.splitext(name)
+        # Replace characters that break SD file list parsing
+        base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+        if not base:
+            base = "unknown_job"
+        # OctoPrint must recognise the extension as machinecode
+        if ext.lower() not in (".gcode", ".gco", ".g"):
+            ext = ".gcode"
+        return (base + ext).lower()
+
+    # Common slicer layer-change comment patterns (compiled once).
+    # Each pattern is its own bucket — we count hits per-pattern and
+    # return the max so that slicers emitting multiple marker types
+    # per layer (e.g. PrusaSlicer: ;LAYER_CHANGE + ;BEFORE_LAYER_CHANGE)
+    # aren't double-counted.
+    _LAYER_PATTERNS: tuple[re.Pattern[str], ...] = (
+        # Cura / ideaMaker: ;LAYER:0, ;LAYER:1, etc.
+        re.compile(r"^;\s*LAYER:\s*\d+", re.IGNORECASE),
+        # Simplify3D: ; layer 1, generated …
+        re.compile(r"^;\s*layer\s+\d+\b", re.IGNORECASE),
+        # PrusaSlicer: ;LAYER_CHANGE
+        re.compile(r"^;LAYER_CHANGE\b"),
+        # Slic3r: ;BEFORE_LAYER_CHANGE
+        re.compile(r"^;BEFORE_LAYER_CHANGE\b"),
+        # KISSlicer: ; BEGIN_LAYER_OBJECT
+        re.compile(r"^;\s*BEGIN_LAYER_OBJECT\b", re.IGNORECASE),
+    )
+
+    # Dremel 3D Slicer header: "; total layer number: 475"
+    _DREMEL_TOTAL_LAYER_RE: re.Pattern[str] = re.compile(
+        r"^;\s*total\s+layer\s+number:\s*(\d+)", re.IGNORECASE
+    )
+
+    # Number of header lines to scan for the Dremel total-layer hint.
+    _HEADER_SCAN_LINES: int = 50
+
+    @staticmethod
+    def _count_gcode_layers(file_path: str) -> int:
+        """Count total layer changes in a GCode file.
+
+        First scans the file header for a Dremel 3D Slicer
+        ``; total layer number: N`` hint and returns *N* immediately
+        if found.  Otherwise scans for common slicer layer-change
+        comments (Cura, PrusaSlicer, Simplify3D, ideaMaker, KISSlicer,
+        Slic3r).  Hits are counted **per-pattern** and the maximum is
+        returned so that slicers emitting multiple marker types per
+        layer are not double-counted.
+
+        The file is read line-by-line to keep memory usage low on
+        Raspberry Pi hosts.
+
+        Returns 0 if no layer markers are found or on any I/O error.
+        """
+        patterns = DremelVirtualSerial._LAYER_PATTERNS
+        counts = [0] * len(patterns)
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line_no, line in enumerate(f, 1):
+                    stripped = line.lstrip()
+                    if not stripped or stripped[0] != ";":
+                        continue
+                    # Fast header check for Dremel slicer total.
+                    if line_no <= DremelVirtualSerial._HEADER_SCAN_LINES:
+                        m = DremelVirtualSerial._DREMEL_TOTAL_LAYER_RE.match(stripped)
+                        if m:
+                            return int(m.group(1))
+                    for i, pat in enumerate(patterns):
+                        if pat.match(stripped):
+                            counts[i] += 1
+                            break
+        except Exception:
+            _LOGGER.debug("Failed to count layers in %s", file_path, exc_info=True)
+        return max(counts) if counts else 0
+
+    def _announce_sd_file(self, sd_name: str, file_size: int,
+                          display_name: str | None = None) -> None:
+        """Inject a file into OctoPrint's SD file list and announce it.
+
+        Sends ``Begin file list`` / entry / ``End file list`` so the file
+        appears in OctoPrint's in-memory SD cache, then sends
+        ``File opened:`` / ``File selected`` so the state panel shows it.
+
+        This is necessary because OctoPrint's frontend calls
+        ``/api/files/sdcard/<name>`` to load file metadata; if the file
+        is absent from the SD list, the API returns 404 and the "File"
+        field stays empty.
+        """
+        # Build the SD file list including our tracked uploads + this file
+        ts = self._to_fat_timestamp()
+        self._send("Begin file list")
+        for f in self._sd_files:
+            name = f.get("name", "unknown.gcode")
+            size = f.get("size", 0)
+            self._send(f"{name} {size}")
+        # Add the currently printing file (with timestamp + longname)
+        if display_name and display_name != sd_name:
+            self._send(f"{sd_name} {file_size} {ts} {display_name}")
+        else:
+            self._send(f"{sd_name} {file_size} {ts}")
+        self._send("End file list")
+
+        # Now announce the file selection
+        self._send(f"File opened: {sd_name} Size: {file_size}")
+        self._send("File selected")
 
     def _process_raw_line(self, raw_line: str) -> None:
         """Process a raw line as received over the virtual serial connection."""
@@ -788,7 +930,31 @@ class DremelVirtualSerial:
         for f in self._sd_files:
             name = f.get("name", "unknown.gcode")
             size = f.get("size", 0)
-            self._send(f"{name} {size}")
+            longname = f.get("longname", "")
+            if longname and longname != name:
+                ts = self._to_fat_timestamp()
+                self._send(f"{name} {size} {ts} {longname}")
+            else:
+                self._send(f"{name} {size}")
+
+        # Include the currently printing file so OctoPrint's frontend
+        # can look it up via the /api/files/sdcard/<name> endpoint.
+        if self._last_announced_sd_name:
+            already_listed = any(
+                f.get("name", "").lower() == self._last_announced_sd_name.lower()
+                for f in self._sd_files
+            )
+            if not already_listed:
+                file_size = int(self._selected_file_size or self._SYNTHETIC_FILE_SIZE)
+                display = self._selected_file_display or self._last_announced_sd_name
+                ts = self._to_fat_timestamp()
+                if display != self._last_announced_sd_name:
+                    self._send(
+                        f"{self._last_announced_sd_name} {file_size} {ts} {display}"
+                    )
+                else:
+                    self._send(f"{self._last_announced_sd_name} {file_size} {ts}")
+
         self._send("End file list")
         self._send("ok")
 
@@ -826,7 +992,8 @@ class DremelVirtualSerial:
             display_name, remote_name, file_size,
         )
 
-        self._send(f"File opened: {display_name} Size: {file_size}")
+        sd_name = self._to_sd_filename(display_name)
+        self._send(f"File opened: {sd_name} Size: {file_size}")
         self._send("File selected")
         self._send("ok")
 
@@ -868,6 +1035,7 @@ class DremelVirtualSerial:
                 # Mark as announced so poll doesn't re-emit File opened.
                 self._was_printing = True
                 self._last_announced_job_name = self._selected_file_display
+                self._last_announced_sd_name = self._to_sd_filename(self._selected_file_display)
                 _LOGGER.info("Print started successfully")
                 self._send("ok")
             except Exception as e:
@@ -957,18 +1125,20 @@ class DremelVirtualSerial:
                 self._send(f"Error: {e}")
                 self._send("ok")
                 return
-        self._printing = False
-        self._paused = False
-        self._selected_file_display = ""
-        self._selected_file_remote = ""
-        self._selected_file_size = 0
-        # Sync phase-tracking state to prevent poll from re-triggering transitions
-        self._was_printing = False
-        self._job_phase = "idle"
-        self._last_job_phase = "idle"
-        self._completion_sent = True  # Suppress redundant completion from poll
-        self._last_announced_job_name = ""
-        self._progress_from_host = False
+        with self._lock:
+            self._printing = False
+            self._paused = False
+            self._selected_file_display = ""
+            self._selected_file_remote = ""
+            self._selected_file_size = 0
+            # Sync phase-tracking state to prevent poll from re-triggering transitions
+            self._was_printing = False
+            self._job_phase = "idle"
+            self._last_job_phase = "idle"
+            self._completion_sent = True  # Suppress redundant completion from poll
+            self._last_announced_job_name = ""
+            self._last_announced_sd_name = ""
+            self._progress_from_host = False
         _LOGGER.info("Print aborted - state reset")
         self._send("ok")
 
@@ -1215,18 +1385,20 @@ class DremelVirtualSerial:
                 self._send(f"Error: {e}")
                 self._send("ok")
                 return
-        self._printing = False
-        self._paused = False
-        self._selected_file_display = ""
-        self._selected_file_remote = ""
-        self._selected_file_size = 0
-        # Sync phase-tracking state to prevent poll from re-triggering transitions
-        self._was_printing = False
-        self._job_phase = "idle"
-        self._last_job_phase = "idle"
-        self._completion_sent = True  # Suppress redundant completion from poll
-        self._last_announced_job_name = ""
-        self._progress_from_host = False
+        with self._lock:
+            self._printing = False
+            self._paused = False
+            self._selected_file_display = ""
+            self._selected_file_remote = ""
+            self._selected_file_size = 0
+            # Sync phase-tracking state to prevent poll from re-triggering transitions
+            self._was_printing = False
+            self._job_phase = "idle"
+            self._last_job_phase = "idle"
+            self._completion_sent = True  # Suppress redundant completion from poll
+            self._last_announced_job_name = ""
+            self._last_announced_sd_name = ""
+            self._progress_from_host = False
         _LOGGER.info("Emergency stop executed - print state reset")
         self._send("ok")
 
@@ -1478,10 +1650,10 @@ class DremelVirtualSerial:
                 return name[: len(name) - len(ext)]
         return name
 
-    def _lookup_sd_index_by_job_name(self, job_name: str) -> tuple[str, str, int] | None:
+    def _lookup_sd_index_by_job_name(self, job_name: str) -> tuple[str, str, int, int] | None:
         """Find an SD index entry matching *job_name* (extension-agnostic).
 
-        Returns ``(display_name, remote_name, size)`` or ``None``.
+        Returns ``(display_name, remote_name, size, total_layers)`` or ``None``.
         """
         if not job_name:
             return None
@@ -1493,6 +1665,7 @@ class DremelVirtualSerial:
                     meta.get("display") or disp,
                     remote,
                     int(meta.get("size") or 0),
+                    int(meta.get("total_layers") or 0),
                 )
         return None
 
@@ -1590,11 +1763,13 @@ class DremelVirtualSerial:
                         # Check if this was one of our uploads
                         match = self._lookup_sd_index_by_job_name(job_name)
                         if match:
-                            display_name, _, file_size = match
+                            display_name, _, file_size, total_layers = match
                             self._selected_file_display = display_name
                             self._selected_file_size = file_size
+                            self._total_layers = total_layers
                         else:
                             self._selected_file_display = job_name
+                            self._total_layers = 0
                     elif not self._selected_file_display:
                         self._selected_file_display = "unknown_job.gcode"
                         self._selected_file_remote = "unknown_job.gcode"
@@ -1605,11 +1780,14 @@ class DremelVirtualSerial:
 
                     # Tell OctoPrint a file is selected so it can enter
                     # the SD printing state when it sees progress bytes.
+                    # We inject the file into the SD file list first so
+                    # OctoPrint's frontend can look it up via API.
                     file_display = self._selected_file_display or "unknown_job.gcode"
                     file_size = int(self._selected_file_size)
-                    self._send(f"File opened: {file_display} Size: {file_size}")
-                    self._send("File selected")
+                    sd_name = self._to_sd_filename(file_display)
+                    self._announce_sd_file(sd_name, file_size, file_display)
                     self._last_announced_job_name = file_display
+                    self._last_announced_sd_name = sd_name
 
                 # ----------------------------------------------------------
                 # Active → active: check for late job-name discovery
@@ -1630,9 +1808,10 @@ class DremelVirtualSerial:
                         self._selected_file_remote = job_name
                         match = self._lookup_sd_index_by_job_name(job_name)
                         if match:
-                            display_name, _, file_size = match
+                            display_name, _, file_size, total_layers = match
                             self._selected_file_display = display_name
                             self._selected_file_size = file_size
+                            self._total_layers = total_layers
                         else:
                             self._selected_file_display = job_name
                         if not self._selected_file_size:
@@ -1640,9 +1819,10 @@ class DremelVirtualSerial:
 
                         file_display = self._selected_file_display
                         file_size = int(self._selected_file_size)
-                        self._send(f"File opened: {file_display} Size: {file_size}")
-                        self._send("File selected")
+                        sd_name = self._to_sd_filename(file_display)
+                        self._announce_sd_file(sd_name, file_size, file_display)
                         self._last_announced_job_name = file_display
+                        self._last_announced_sd_name = sd_name
 
                 # ----------------------------------------------------------
                 # Transition: active → terminal (completed / abort)
@@ -1657,6 +1837,8 @@ class DremelVirtualSerial:
                     self._selected_file_remote = ""
                     self._selected_file_size = 0
                     self._last_announced_job_name = ""
+                    self._last_announced_sd_name = ""
+                    self._total_layers = 0
                     self._progress_from_host = False
                     self._completion_sent = True
 
@@ -1701,6 +1883,7 @@ class DremelVirtualSerial:
                     if match:
                         self._selected_file_display = match[0]
                         self._selected_file_size = match[2]
+                        self._total_layers = match[3]
 
         except Exception as e:
             self._connection_errors += 1
@@ -1728,15 +1911,31 @@ class DremelVirtualSerial:
         with self._lock:
             self._sd_files = []
             for meta in self._sd_index.values():
+                display_name = meta.get("display") or meta.get("remote") or "unknown.gcode"
+                sd_name = self._to_sd_filename(str(display_name))
                 self._sd_files.append(
-                    {"name": meta.get("display") or meta.get("remote") or "unknown.gcode", "size": int(meta.get("size") or 0)}
+                    {
+                        "name": sd_name,
+                        "longname": str(display_name),
+                        "size": int(meta.get("size") or 0),
+                    }
                 )
 
             # If we have a selected job that isn't in the index, still surface it for compatibility
             if self._selected_file_remote:
                 selected_display = self._selected_file_display or self._selected_file_remote
-                if not any(f.get("name", "").lower() == selected_display.lower() for f in self._sd_files):
-                    self._sd_files.append({"name": selected_display, "size": int(self._selected_file_size or 0)})
+                selected_sd_name = self._to_sd_filename(selected_display)
+                if not any(
+                    f.get("name", "").lower() == selected_sd_name.lower()
+                    for f in self._sd_files
+                ):
+                    self._sd_files.append(
+                        {
+                            "name": selected_sd_name,
+                            "longname": selected_display,
+                            "size": int(self._selected_file_size or 0),
+                        }
+                    )
 
     def _resolve_sd_filename(self, filename: str) -> Optional[tuple[str, str, int]]:
         """Resolve an SD filename from display name to remote name.
@@ -1756,6 +1955,16 @@ class DremelVirtualSerial:
         for disp, meta in self._sd_index.items():
             if (meta.get("remote") or "").lower() == name.lower():
                 return (meta.get("display") or disp, meta.get("remote") or name, int(meta.get("size") or 0))
+
+        # Allow selecting by SD-safe filename (e.g. name with spaces sanitised)
+        for disp, meta in self._sd_index.items():
+            candidate = meta.get("display") or disp
+            if self._to_sd_filename(str(candidate)).lower() == name.lower():
+                return (
+                    meta.get("display") or disp,
+                    meta.get("remote") or disp,
+                    int(meta.get("size") or 0),
+                )
 
         # Fall back to whatever is currently selected (useful if firmware reports a job name)
         if self._selected_file_remote and self._selected_file_remote.lower() == name.lower():
@@ -1805,13 +2014,27 @@ class DremelVirtualSerial:
                     printed = int((float(self._progress) / 100.0) * float(total))
                     self._send(f"SD printing byte {printed}/{total}")
 
+                    # M73 progress report — OctoPrint 1.9+ parses this
+                    # from firmware output and uses it for the state panel
+                    # "Printed", "Print Time Left", and "Approx Total
+                    # Print Time" fields.
+                    remaining_min = max(int(self._remaining_time / 60), 0)
+                    self._send(
+                        f"M73 P{int(self._progress)} R{remaining_min}"
+                    )
+
                     # Proactive layer reporting for plugins like
                     # DisplayLayerProgress which parse //action:notification
                     # lines from serial output.
                     if self._current_layer > 0:
-                        self._send(
-                            f"//action:notification Layer {self._current_layer}"
-                        )
+                        if self._total_layers > 0:
+                            self._send(
+                                f"//action:notification Layer {self._current_layer}/{self._total_layers}"
+                            )
+                        else:
+                            self._send(
+                                f"//action:notification Layer {self._current_layer}"
+                            )
 
                 elif self._autosd_enabled and self._autosd_interval > 0:
                     # When idle, only send "Not SD printing" if auto-report
@@ -1875,11 +2098,17 @@ class DremelVirtualSerial:
 
             display_name = remote_name or uploaded_name
 
+            # Count total layers from GCode before the local file is removed
+            total_layers = self._count_gcode_layers(local_path)
+            if total_layers:
+                _LOGGER.info("Counted %d layers in %s", total_layers, local_path)
+
             with self._lock:
                 self._sd_index[display_name] = {
                     "display": display_name,
                     "remote": uploaded_name,
                     "size": file_size,
+                    "total_layers": total_layers,
                 }
                 _LOGGER.debug(
                     "Added to SD index: display=%s, remote=%s",
