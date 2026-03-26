@@ -11,12 +11,16 @@ virtual serial transport pattern (like the bundled virtual_printer plugin).
 Hooks used:
     - octoprint.comm.transport.serial.factory
     - octoprint.comm.transport.serial.additional_port_names
+    - octoprint.comm.protocol.gcode.queuing
     - octoprint.printer.estimation.remaining
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 # OctoPrint may not be available during testing
@@ -49,6 +53,7 @@ if _OCTOPRINT_AVAILABLE:
     class Dremel3D45Plugin(
         octoprint.plugin.StartupPlugin,
         octoprint.plugin.ShutdownPlugin,
+        octoprint.plugin.EventHandlerPlugin,
         octoprint.plugin.SettingsPlugin,
         octoprint.plugin.SimpleApiPlugin,
         octoprint.plugin.TemplatePlugin,
@@ -59,6 +64,7 @@ if _OCTOPRINT_AVAILABLE:
         def __init__(self):
             super().__init__()
             self._virtual_serial = None
+            self._local_print_redirecting = False
 
         # -------------------------------------------------------------------------
         # StartupPlugin
@@ -109,6 +115,26 @@ if _OCTOPRINT_AVAILABLE:
                     _LOGGER.warning("Error closing virtual serial connection: %s", e)
                 self._virtual_serial = None
             _LOGGER.info("Dremel 3D45 plugin shutdown complete")
+
+        # -------------------------------------------------------------------------
+        # EventHandlerPlugin
+        # -------------------------------------------------------------------------
+
+        def on_event(self, event, payload):
+            """React to OctoPrint events.
+
+            Detects local file prints (which the Dremel cannot execute via
+            streamed GCode) and logs the redirect.  The actual interception
+            and suppression happens in ``gcode_queuing_hook``.
+            """
+            if not self._virtual_serial:
+                return
+
+            if event == "PrintStarted" and payload.get("origin") == "local":
+                _LOGGER.info(
+                    "Local file print detected: %s — will be redirected to Dremel",
+                    payload.get("name", "unknown"),
+                )
 
         # -------------------------------------------------------------------------
         # SettingsPlugin
@@ -508,6 +534,178 @@ if _OCTOPRINT_AVAILABLE:
             return [DREMEL_PORT_NAME]
 
         # -------------------------------------------------------------------------
+        # GCode Queuing Hook — Local Print Interception
+        # -------------------------------------------------------------------------
+
+        def gcode_queuing_hook(
+            self,
+            comm_instance,
+            phase,
+            cmd,
+            cmd_type,
+            gcode,
+            subcode=None,
+            tags=None,
+            *args,
+            **kwargs,
+        ):
+            """
+            Hook: octoprint.comm.protocol.gcode.queuing
+
+            The Dremel 3D45 cannot execute streamed GCode — it can only
+            print files uploaded to it via REST API.  When OctoPrint
+            streams a local file, we suppress every command and redirect
+            to the Dremel's native upload-and-print workflow in a
+            background thread.
+            """
+            if not self._virtual_serial:
+                return None
+
+            if tags is None:
+                tags = set()
+
+            # During a redirect, also suppress after-print script commands
+            # (e.g. afterPrintDone sends M104 S0 / M140 S0 cooldown that
+            # would interfere with the Dremel's own preheat cycle).
+            if self._local_print_redirecting:
+                if any(t.startswith("source:script") for t in tags):
+                    return (None,)
+
+            # Only intercept file-sourced commands
+            if "source:file" not in tags:
+                return None
+
+            # First file command: kick off the redirect
+            if not self._local_print_redirecting:
+                self._local_print_redirecting = True
+
+                # Extract the file path from OctoPrint's comm layer
+                file_path = None
+                try:
+                    current_file = getattr(comm_instance, "_currentFile", None)
+                    if current_file and hasattr(current_file, "getFilename"):
+                        file_path = current_file.getFilename()
+                except Exception:
+                    _LOGGER.debug(
+                        "Could not read file path from comm instance",
+                        exc_info=True,
+                    )
+
+                file_name = os.path.basename(file_path) if file_path else None
+                _LOGGER.info(
+                    "Intercepting local file print — redirecting to Dremel: %s",
+                    file_name or "(unknown)",
+                )
+
+                threading.Thread(
+                    target=self._do_redirect_local_print,
+                    args=(file_path, file_name),
+                    daemon=True,
+                    name="DremelLocalPrintRedirect",
+                ).start()
+
+            # Suppress every file-sourced command
+            return (None,)
+
+        # ------------------------------------------------------------------ #
+        #  Background redirect logic                                          #
+        # ------------------------------------------------------------------ #
+
+        def _do_redirect_local_print(self, file_path, file_name):
+            """Upload a local file to the Dremel and start printing.
+
+            Runs in a background thread.  ``gcode_queuing_hook`` suppresses
+            all streamed commands while this is in progress.
+            """
+            try:
+                if not file_path or not os.path.isfile(file_path):
+                    _LOGGER.error(
+                        "Cannot redirect local print: file not found (%s)",
+                        file_path,
+                    )
+                    self._notify_redirect("error", file_name, "File not found")
+                    return
+
+                vs = self._virtual_serial
+                if not vs or getattr(vs, "_closed", True):
+                    _LOGGER.error("Cannot redirect local print: not connected")
+                    self._notify_redirect(
+                        "error", file_name, "Not connected to printer"
+                    )
+                    return
+
+                # Notify the frontend that upload is beginning
+                self._notify_redirect("uploading", file_name)
+
+                # Upload via the existing SD upload machinery
+                if not vs.upload_file(file_path, file_name):
+                    _LOGGER.error("Dremel upload failed for %s", file_name)
+                    self._notify_redirect("error", file_name, "Upload failed")
+                    return
+
+                # Retrieve the remote name assigned by the Dremel
+                with vs._lock:
+                    remote_name = vs._selected_file_remote
+                    display_name = vs._selected_file_display
+
+                if not remote_name:
+                    _LOGGER.error("Upload OK but no remote name available")
+                    self._notify_redirect(
+                        "error", file_name, "Internal upload error"
+                    )
+                    return
+
+                # Start the print via the Dremel REST API
+                _LOGGER.info(
+                    "Starting Dremel print: %s (remote=%s)",
+                    display_name,
+                    remote_name,
+                )
+                from .vendor.dremel3dpy import PRINT_COMMAND, default_request
+
+                default_request(vs._host, {PRINT_COMMAND: remote_name})
+
+                # Pre-populate poll-thread state so it doesn't re-announce
+                with vs._lock:
+                    vs._was_printing = True
+                    vs._last_announced_job_name = display_name
+                    vs._last_announced_sd_name = vs._to_sd_filename(
+                        display_name
+                    )
+
+                _LOGGER.info(
+                    "Local print redirected to Dremel successfully: %s",
+                    display_name,
+                )
+                self._notify_redirect("success", display_name)
+
+            except Exception:
+                _LOGGER.exception("Local print redirect failed")
+                self._notify_redirect(
+                    "error", file_name, "Unexpected error during redirect"
+                )
+            finally:
+                # Keep the flag active long enough for OctoPrint's
+                # afterPrintDone script to be suppressed, then clear.
+                time.sleep(5)
+                self._local_print_redirecting = False
+
+        def _notify_redirect(self, status, filename=None, message=None):
+            """Push a redirect status notification to the frontend."""
+            try:
+                self._plugin_manager.send_plugin_message(
+                    self._identifier,
+                    {
+                        "type": "local_print_redirect",
+                        "status": status,
+                        "filename": filename or "",
+                        "message": message or "",
+                    },
+                )
+            except Exception:
+                pass
+
+        # -------------------------------------------------------------------------
         # SD Card Upload Hook
         # -------------------------------------------------------------------------
 
@@ -591,6 +789,8 @@ def __plugin_load__():
         "octoprint.comm.transport.serial.additional_port_names": plugin.get_additional_port_names,
         # SD card upload hook
         "octoprint.printer.sdcardupload": plugin.sdcard_upload_hook,
+        # GCode queuing hook — intercept local file prints
+        "octoprint.comm.protocol.gcode.queuing": plugin.gcode_queuing_hook,
         # Print time estimation from Dremel API
         "octoprint.printer.estimation.remaining": plugin.estimate_remaining_print_time,
     }
