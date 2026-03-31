@@ -41,3 +41,16 @@ test_connection.py
 plan-dremel3d45.prompt.md
 pyrightconfig.json
 encryption.log
+.github/copilot-instructions.md
+.github/prompts/add-gcode-handler.prompt.md
+.github/prompts/code-review.prompt.md
+.github/prompts/debug-communication.prompt.md
+.github/prompts/modify-plugin-hooks.prompt.md
+.github/prompts/modify-vendored-lib.prompt.md
+.github/prompts/run-tests.prompt.md
+scripts/phase1_metrics_collector.py
+scripts/phase1_metrics/phase1-metrics-results.csv
+scripts/phase1_metrics/phase1-metrics-results.md
+scripts/phase1_metrics/phase1-metrics-state.json
+scripts/phase1_metrics/phase1-request-log.csv
+scripts/phase1_metrics/phase1-request-log.jsonl

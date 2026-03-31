@@ -35,6 +35,11 @@ sys.modules.setdefault("octoprint", _octoprint_stub)
 sys.modules.setdefault("octoprint.plugin", _octoprint_stub.plugin)
 sys.modules.setdefault("octoprint.settings", MagicMock())
 
+# Flask is not installed in the test environment; provide minimal stub.
+_flask_stub = MagicMock()
+_flask_stub.jsonify = lambda **kwargs: kwargs
+sys.modules.setdefault("flask", _flask_stub)
+
 # Now we can import the plugin
 from octoprint_dremel3d45 import Dremel3D45Plugin  # noqa: E402
 
@@ -240,8 +245,6 @@ class TestDoRedirectLocalPrint(unittest.TestCase):
         self.mock_vs._selected_file_display = "test.gcode"
         self.mock_vs._was_printing = False
         self.mock_vs._last_announced_job_name = ""
-        self.mock_vs._last_announced_sd_name = ""
-        self.mock_vs._to_sd_filename.return_value = "TEST~1.GCO"
         self.mock_vs.upload_file.return_value = True
         self.mock_vs._host = "192.168.1.100"
         self.plugin._virtual_serial = self.mock_vs
@@ -409,6 +412,85 @@ class TestNotifyRedirect(unittest.TestCase):
         self.plugin._plugin_manager = None
         # Should not raise
         self.plugin._notify_redirect("error", "test.gcode", "boom")
+
+
+class TestHandleTestConnection(unittest.TestCase):
+    """Test connection test API behavior and live-session reuse."""
+
+    def setUp(self):
+        self.plugin = Dremel3D45Plugin()
+        self.plugin._settings = MagicMock()
+        self._settings_data = {
+            "printer_ip": "192.168.1.50",
+            "request_timeout": 30,
+        }
+        self.plugin._settings.get.side_effect = lambda path: self._settings_data.get(path[0])
+        self.plugin._settings.get_int.side_effect = lambda path: int(self._settings_data.get(path[0]))
+
+    @patch("flask.jsonify", side_effect=lambda **kwargs: kwargs)
+    @patch("octoprint_dremel3d45.vendor.dremel3dpy.Dremel3DPrinter")
+    def test_uses_live_virtual_session_when_healthy(self, mock_printer_cls, mock_jsonify):
+        live_printer = MagicMock()
+        live_printer.get_firmware_version.return_value = "3.0"
+        live_printer.get_title.return_value = "Dremel 3D45"
+        live_printer.get_serial_number.return_value = "LIVE123"
+
+        self.plugin._virtual_serial = MagicMock(
+            _closed=False,
+            _host="192.168.1.50",
+            _connected=True,
+            _connection_errors=0,
+            _printer=live_printer,
+        )
+
+        result = self.plugin._handle_test_connection()
+
+        mock_printer_cls.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "live-session")
+        self.assertEqual(result["serial"], "LIVE123")
+
+    @patch("flask.jsonify", side_effect=lambda **kwargs: kwargs)
+    @patch("octoprint_dremel3d45.vendor.dremel3dpy.Dremel3DPrinter")
+    def test_falls_back_to_fresh_probe_when_no_active_session(self, mock_printer_cls, mock_jsonify):
+        fresh_printer = MagicMock()
+        fresh_printer.get_firmware_version.return_value = "3.0"
+        fresh_printer.get_title.return_value = "Dremel 3D45"
+        fresh_printer.get_serial_number.return_value = "PROBE123"
+        mock_printer_cls.return_value = fresh_printer
+
+        self.plugin._virtual_serial = None
+
+        result = self.plugin._handle_test_connection()
+
+        mock_printer_cls.assert_called_once_with("192.168.1.50")
+        fresh_printer.set_printer_info.assert_called_once_with(refresh=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "fresh-probe")
+        self.assertEqual(result["serial"], "PROBE123")
+
+    @patch("flask.jsonify", side_effect=lambda **kwargs: kwargs)
+    @patch("octoprint_dremel3d45.vendor.dremel3dpy.Dremel3DPrinter")
+    def test_falls_back_to_fresh_probe_when_session_has_errors(self, mock_printer_cls, mock_jsonify):
+        fresh_printer = MagicMock()
+        fresh_printer.get_firmware_version.return_value = "3.0"
+        fresh_printer.get_title.return_value = "Dremel 3D45"
+        fresh_printer.get_serial_number.return_value = "PROBE456"
+        mock_printer_cls.return_value = fresh_printer
+
+        self.plugin._virtual_serial = MagicMock(
+            _closed=False,
+            _host="192.168.1.50",
+            _connected=True,
+            _connection_errors=2,
+            _printer=MagicMock(),
+        )
+
+        result = self.plugin._handle_test_connection()
+
+        mock_printer_cls.assert_called_once_with("192.168.1.50")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "fresh-probe")
 
 
 if __name__ == "__main__":

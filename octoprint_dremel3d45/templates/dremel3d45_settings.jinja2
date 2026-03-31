@@ -40,18 +40,35 @@
         </div>
 
         <div class="control-group">
-            <label class="control-label" for="settings-dremel3d45-poll_interval">
-                Poll Interval (seconds)
+            <label class="control-label" for="settings-dremel3d45-poll_interval_printing">
+                Printing Poll Interval (seconds)
             </label>
             <div class="controls">
                 <input type="number" 
-                       id="settings-dremel3d45-poll_interval"
+                       id="settings-dremel3d45-poll_interval_printing"
                        class="input-mini"
-                       data-bind="value: settings.plugins.dremel3d45.poll_interval"
-                       min="2"
+                       data-bind="value: settings.plugins.dremel3d45.poll_interval_printing"
+                       min="1"
                        max="120">
                 <span class="help-block">
-                    Status update interval. Default: 10
+                    Status update interval while printing or paused. Default: 5
+                </span>
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label class="control-label" for="settings-dremel3d45-poll_interval_idle">
+                Idle Poll Interval (seconds)
+            </label>
+            <div class="controls">
+                <input type="number" 
+                       id="settings-dremel3d45-poll_interval_idle"
+                       class="input-mini"
+                       data-bind="value: settings.plugins.dremel3d45.poll_interval_idle"
+                       min="1"
+                       max="300">
+                <span class="help-block">
+                    Status update interval when printer is idle. Default: 15
                 </span>
             </div>
         </div>
@@ -139,54 +156,5 @@
         <strong>Security Notice:</strong>
         The Dremel 3D45's network interface has no authentication. 
         Only use this on a trusted local network.
-    </div>
-
-    <h4>SD Index</h4>
-
-    {#
-      IMPORTANT:
-      This settings template is normally bound by OctoPrint's SettingsViewModel
-      (because custom_bindings is False). The SD Index section is bound by our
-      custom plugin ViewModel. Use stopBinding to prevent the SettingsViewModel
-      from evaluating bindings like sdIndexConnected() here.
-    #}
-    <div data-bind="stopBinding: true">
-        <div id="settings_plugin_dremel3d45_sdindex">
-        <div class="alert alert-info">
-            This plugin maintains an SD index mapping of uploaded filenames to the printer's internal upload names.
-            The Dremel API does not provide a reliable directory listing, so this mapping is how commands like <strong>M20/M23/M32</strong> work.
-        </div>
-
-        <div class="form-horizontal">
-        <div class="control-group">
-            <label class="control-label">Status</label>
-            <div class="controls">
-                <span data-bind="text: sdIndexConnected() ? 'Connected' : 'Not connected'"></span>
-                <span class="help-block">
-                    SD index entries: <span data-bind="text: sdIndexCount"></span>
-                </span>
-                <button type="button" class="btn" data-bind="click: refreshSdIndex">Refresh</button>
-                <button type="button" class="btn btn-danger" data-bind="click: clearSdIndex">Clear Index</button>
-            </div>
-        </div>
-    </div>
-
-        <table class="table table-condensed" data-bind="visible: sdIndexItems().length > 0">
-            <thead>
-                <tr>
-                    <th>Display Name</th>
-                    <th>Printer Upload Name</th>
-                    <th>Size (bytes)</th>
-                </tr>
-            </thead>
-            <tbody data-bind="foreach: sdIndexItems">
-                <tr>
-                    <td data-bind="text: display"></td>
-                    <td data-bind="text: remote"></td>
-                    <td data-bind="text: size"></td>
-                </tr>
-            </tbody>
-        </table>
-        </div>
     </div>
 </div>

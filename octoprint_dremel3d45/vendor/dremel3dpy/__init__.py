@@ -19,6 +19,7 @@ import os
 import random
 import re
 import string
+import threading
 from typing import Any, Dict
 
 import requests
@@ -81,6 +82,32 @@ from .helpers.constants import (
     STATUS,
     USAGE_COUNTER,
 )
+
+
+_THREAD_LOCAL_SESSION = threading.local()
+
+
+def _get_thread_session() -> requests.Session:
+    """Return a per-thread HTTP session for connection reuse."""
+    session = getattr(_THREAD_LOCAL_SESSION, "session", None)
+    if session is None:
+        session = requests.Session()
+        _THREAD_LOCAL_SESSION.session = session
+    return session
+
+
+def _reset_thread_session() -> requests.Session:
+    """Reset and return the current thread's HTTP session."""
+    session = getattr(_THREAD_LOCAL_SESSION, "session", None)
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    session = requests.Session()
+    _THREAD_LOCAL_SESSION.session = session
+    return session
 
 
 class Dremel3DPrinter:
@@ -563,11 +590,19 @@ def default_request(
         # IMPORTANT: Dremel printer HTTPS endpoints commonly use invalid/expired
         # certificates in the field. DO NOT enable certificate verification for
         # printer API calls, or connectivity will fail for many real devices.
-        response = requests.post(
+        response = _get_thread_session().post(
             url, data=command, timeout=REQUEST_TIMEOUT, verify=False
         )
     except requests.RequestException as exc:
-        raise RuntimeError(f"Request failed for {url}: {exc}") from exc
+        # A cached keep-alive socket can go stale between polls; retry once
+        # with a fresh session for the current thread.
+        _LOGGER.debug("Request failed for %s, retrying once with fresh session: %s", url, exc)
+        try:
+            response = _reset_thread_session().post(
+                url, data=command, timeout=REQUEST_TIMEOUT, verify=False
+            )
+        except requests.RequestException as retry_exc:
+            raise RuntimeError(f"Request failed for {url}: {retry_exc}") from retry_exc
 
     response_json: Dict[str, Any] = {}
     try:

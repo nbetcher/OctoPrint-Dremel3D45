@@ -19,15 +19,13 @@ Hooks used:
 
 from __future__ import annotations
 
-import datetime
 import logging
-import json
 import os
 import queue
 import re
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from .vendor.dremel3dpy import Dremel3DPrinter, PRINT_COMMAND, default_request
 
@@ -50,23 +48,25 @@ class DremelVirtualSerial:
     GCode commands are translated to REST API calls:
     - M105 (temps) -> GET status, return temps
     - M115 (firmware) -> GET printer info
-    - M20 (list SD) -> List files on printer
-    - M23 (select file) -> Select file for printing
     - M24 (start/resume) -> Start or resume print
     - M25 (pause) -> Pause print
-    - M27 (SD status) -> Report print progress
+    - M27 (print status) -> Report print progress
     - M524 (abort) -> Cancel print
     - etc.
     """
 
-    _SD_INDEX_SCHEMA_VERSION = 1
-
     # When file size is unknown (external prints), use a synthetic size so
-    # OctoPrint's SD progress tracking gets proportional byte counts.
+    # OctoPrint's progress tracking gets proportional byte counts.
     # Must be large enough to avoid OctoPrint's "current == total" end-of-print
     # check triggering prematurely, but the actual value is arbitrary since
     # progress is derived from the Dremel API percentage.
     _SYNTHETIC_FILE_SIZE = 1000000
+
+    # TTL (seconds) for cached API data that changes rarely.
+    # Printer info (firmware, serial, model) is effectively static.
+    _PRINTER_INFO_TTL = 300  # 5 minutes
+    # Extra status (max temps, storage, usage counter) changes rarely.
+    _EXTRA_STATUS_TTL = 120  # 2 minutes
 
     # Dremel job phases that indicate an active print job.
     # Values from REST API: idle, preparing, building, completed, abort,
@@ -93,7 +93,6 @@ class DremelVirtualSerial:
         settings: "Settings",
         read_timeout: float = 5.0,
         write_timeout: float = 10.0,
-        data_folder: Optional[str] = None,
     ):
         self._settings = settings
         self._read_timeout = read_timeout
@@ -133,14 +132,9 @@ class DremelVirtualSerial:
         # Local state cache
         self._connected = False
         self._temps = {"tool0": (0.0, 0.0), "bed": (0.0, 0.0), "chamber": (0.0, 0.0)}
-        # SD file index is session-scoped (Dremel API has no file listing we can query via dremel3dpy)
-        # display_name -> {display, remote, size}
-        self._sd_index: dict[str, dict] = {}
-        self._sd_index_path: Optional[str] = None
         self._selected_file_display: str = ""
         self._selected_file_remote: str = ""
         self._selected_file_size: int = 0
-        self._sd_files: list[dict] = []
         self._printing = False
         self._paused = False
         self._was_printing = False  # Track previous state to detect print completion
@@ -148,7 +142,6 @@ class DremelVirtualSerial:
         self._last_job_phase = "idle"  # Previous job phase for transition detection
         self._completion_sent = False  # One-shot guard for completion messages
         self._last_announced_job_name = ""  # Last job name sent in File opened:
-        self._last_announced_sd_name = ""  # SD-safe filename used in File opened:
         self._progress = 0
         self._progress_from_host = False  # Guard: host-set M73 progress vs API
         self._elapsed_time = 0
@@ -160,13 +153,14 @@ class DremelVirtualSerial:
         self._door_open = False  # Door sensor state
         self._fan_speed = 0  # Fan speed (read-only, can't control)
 
+        # Timestamps for TTL-gated API refreshes
+        self._printer_info_ts: float = 0.0
+        self._extra_status_ts: float = 0.0
+
         # Auto-reporting controls (Marlin-style)
         self._autotemp_enabled = False
         self._autotemp_interval = 0
         self._last_autotemp_ts = 0.0
-        self._autosd_enabled = False
-        self._autosd_interval = 0
-        self._last_autosd_ts = 0.0
 
         # Read buffer for callers using read(size)
         self._read_buffer = bytearray()
@@ -178,124 +172,21 @@ class DremelVirtualSerial:
         # Polling thread for status updates
         self._poll_thread: Optional[threading.Thread] = None
         self._poll_stop = threading.Event()
-        configured_poll = settings.get_int(["poll_interval"])
-        if configured_poll is None:
-            configured_poll = 10
-        self._poll_interval = max(1, int(configured_poll))
+        self._poll_interval_active, self._poll_interval_idle = self._resolve_poll_intervals()
+        # Backward-compatible alias used by older code paths and tests.
+        self._poll_interval = self._poll_interval_active
 
-        _LOGGER.debug("Poll interval: %ds", self._poll_interval)
+        _LOGGER.debug(
+            "Poll intervals: active=%ds, idle=%ds",
+            self._poll_interval_active,
+            self._poll_interval_idle,
+        )
 
         # Lock for thread safety
         self._lock = threading.RLock()
 
-        # Optional persisted SD index path
-        if data_folder:
-            _LOGGER.debug("Data folder provided: %s", data_folder)
-            try:
-                os.makedirs(data_folder, exist_ok=True)
-                self._sd_index_path = os.path.join(data_folder, "sd_index.json")
-                _LOGGER.debug("SD index path: %s", self._sd_index_path)
-            except Exception as e:
-                _LOGGER.warning("Failed to initialize data folder %r: %s", data_folder, e)
-                self._sd_index_path = None
-        else:
-            _LOGGER.debug("No data folder provided - SD index will not be persisted")
-
-        # Load persisted SD index (best-effort)
-        self._load_sd_index()
-
         # Start communication
         self._start()
-
-    def _load_sd_index(self) -> None:
-        """Load the persisted SD index from disk (best-effort)."""
-        path = self._sd_index_path
-        if not path:
-            _LOGGER.debug("No SD index path configured - skipping load")
-            return
-
-        _LOGGER.debug("Loading SD index from %s", path)
-
-        try:
-            if not os.path.exists(path):
-                _LOGGER.debug("SD index file does not exist")
-                return
-
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-
-            version = int(payload.get("schema_version", 0) or 0)
-            if version != self._SD_INDEX_SCHEMA_VERSION:
-                _LOGGER.warning(
-                    "Unsupported sd_index schema_version=%s (expected %s); ignoring",
-                    version,
-                    self._SD_INDEX_SCHEMA_VERSION,
-                )
-                return
-
-            items = payload.get("items", {})
-            if not isinstance(items, dict):
-                _LOGGER.warning("Invalid sd_index format; ignoring")
-                return
-
-            cleaned: dict[str, dict] = {}
-            for display, meta in items.items():
-                if not isinstance(meta, dict):
-                    continue
-                disp = str(meta.get("display") or display)
-                remote = str(meta.get("remote") or "")
-                if not remote:
-                    continue
-                try:
-                    size = int(meta.get("size") or 0)
-                except Exception:
-                    size = 0
-                try:
-                    total_layers = int(meta.get("total_layers") or 0)
-                except Exception:
-                    total_layers = 0
-                cleaned[disp] = {
-                    "display": disp, "remote": remote,
-                    "size": size, "total_layers": total_layers,
-                }
-
-            with self._lock:
-                self._sd_index = cleaned
-
-            if cleaned:
-                _LOGGER.info("Loaded %d SD index entries", len(cleaned))
-
-        except Exception as e:
-            _LOGGER.warning("Failed to load sd_index from %s: %s", path, e)
-
-    def _save_sd_index(self) -> None:
-        """Persist the SD index to disk (best-effort)."""
-        path = self._sd_index_path
-        if not path:
-            _LOGGER.debug("No SD index path configured - skipping save")
-            return
-
-        _LOGGER.debug("Saving SD index to %s", path)
-
-        try:
-            with self._lock:
-                items = dict(self._sd_index)
-
-            _LOGGER.debug("Saving %d SD index entries", len(items))
-
-            payload = {
-                "schema_version": self._SD_INDEX_SCHEMA_VERSION,
-                "updated_at": int(time.time()),
-                "items": items,
-            }
-
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
-            os.replace(tmp_path, path)
-            _LOGGER.debug("SD index saved successfully")
-        except Exception as e:
-            _LOGGER.warning("Failed to save sd_index to %s: %s", path, e)
 
     # -------------------------------------------------------------------------
     # Serial-like interface (required by OctoPrint)
@@ -463,10 +354,7 @@ class DremelVirtualSerial:
         (poll interval, request timeout) take effect without reconnecting.
         """
         new_timeout = self._settings.get_int(["request_timeout"]) or 30
-        new_poll = self._settings.get_int(["poll_interval"])
-        if new_poll is None:
-            new_poll = 10
-        new_poll = max(1, int(new_poll))
+        new_poll_active, new_poll_idle = self._resolve_poll_intervals()
 
         if new_timeout != self._request_timeout:
             _LOGGER.info("Request timeout changed: %ds → %ds", self._request_timeout, new_timeout)
@@ -476,9 +364,62 @@ class DremelVirtualSerial:
             _dremel_constants.REQUEST_TIMEOUT = new_timeout
             _dremel3dpy.REQUEST_TIMEOUT = new_timeout
 
-        if new_poll != self._poll_interval:
-            _LOGGER.info("Poll interval changed: %ds → %ds", self._poll_interval, new_poll)
-            self._poll_interval = new_poll
+        if (
+            new_poll_active != self._poll_interval_active
+            or new_poll_idle != self._poll_interval_idle
+        ):
+            _LOGGER.info(
+                "Poll intervals changed: active %ds → %ds, idle %ds → %ds",
+                self._poll_interval_active,
+                new_poll_active,
+                self._poll_interval_idle,
+                new_poll_idle,
+            )
+            self._poll_interval_active = new_poll_active
+            self._poll_interval_idle = new_poll_idle
+            self._poll_interval = new_poll_active
+
+    def _resolve_poll_intervals(self) -> Tuple[int, int]:
+        """Resolve active/idle poll intervals from settings.
+
+        Uses ``poll_interval_printing`` and ``poll_interval_idle`` when set,
+        with ``poll_interval`` as a legacy fallback for backward compatibility.
+        """
+        legacy_poll = self._settings.get_int(["poll_interval"])
+        if legacy_poll is None:
+            legacy_poll = 10
+        legacy_poll = max(1, int(legacy_poll))
+
+        configured_active = self._settings.get_int(["poll_interval_printing"])
+        if configured_active is None:
+            configured_active = legacy_poll
+        active_interval = max(1, int(configured_active))
+
+        configured_idle = self._settings.get_int(["poll_interval_idle"])
+        if configured_idle is None:
+            configured_idle = max(active_interval, legacy_poll)
+        idle_interval = max(1, int(configured_idle))
+
+        if idle_interval < active_interval:
+            _LOGGER.warning(
+                "poll_interval_idle (%ds) cannot be lower than poll_interval_printing (%ds); "
+                "clamping to %ds",
+                idle_interval,
+                active_interval,
+                active_interval,
+            )
+            idle_interval = active_interval
+
+        return active_interval, idle_interval
+
+    def _current_poll_interval(self) -> int:
+        """Return the currently applicable poll interval.
+
+        Use a faster cadence during active prints and a slower cadence while idle.
+        """
+        if self._printing or self._paused:
+            return self._poll_interval_active
+        return self._poll_interval_idle
 
     # -------------------------------------------------------------------------
     # Startup / Connection
@@ -493,17 +434,14 @@ class DremelVirtualSerial:
             return
 
         # Queue initial startup messages (Marlin boot sequence)
-        # NOTE: We only send "start" + "SD card ok" here. OctoPrint will
-        # respond by sending M110 (line number reset) and M115 (firmware info
-        # request). Our M115 handler sends the FIRMWARE_NAME and Cap: lines
-        # in response.  Sending capabilities here eagerly causes race
-        # conditions with OctoPrint's M110 reset, leading to "resend request"
-        # warnings.
-        # "SD card ok" is required for OctoPrint to enable SD card features,
-        # which are essential since this plugin simulates SD card printing.
+        # NOTE: We only send "start" here. OctoPrint will respond by
+        # sending M110 (line number reset) and M115 (firmware info
+        # request). Our M115 handler sends the FIRMWARE_NAME and Cap:
+        # lines in response.  Sending capabilities here eagerly causes
+        # race conditions with OctoPrint's M110 reset, leading to
+        # "resend request" warnings.
         self._send("")  # Empty line
         self._send("start")
-        self._send("SD card ok")
 
         # Try to connect to printer using dremel3dpy library
         try:
@@ -511,6 +449,7 @@ class DremelVirtualSerial:
             self._printer = Dremel3DPrinter(self._host)
             # Explicitly fetch printer info (constructor no longer auto-refreshes)
             self._printer.set_printer_info(refresh=True)
+            self._printer_info_ts = time.time()
             self._connected = True
             _LOGGER.info("Connected to Dremel printer at %s", self._host)
 
@@ -571,135 +510,6 @@ class DremelVirtualSerial:
         Use this to guard operations that should not occur during printing.
         """
         return self._printing and not self._paused
-
-    @staticmethod
-    def _to_fat_timestamp(dt: datetime.datetime | None = None) -> str:
-        """Encode a datetime as a FAT hex timestamp for M20 file list entries.
-
-        OctoPrint's ``parse_file_list_line`` recognises these as upload dates
-        and forwards them to the frontend's *Uploaded* field.
-        """
-        if dt is None:
-            dt = datetime.datetime.now()
-        date_part = dt.day | (dt.month << 5) | ((dt.year - 1980) << 9)
-        time_part = (dt.second // 2) | (dt.minute << 5) | (dt.hour << 11)
-        return f"0x{(date_part << 16) | time_part:08X}"
-
-    @staticmethod
-    def _to_sd_filename(display_name: str) -> str:
-        """Convert a display name to a valid SD card filename.
-
-        The returned name is lowercase, contains no spaces, and has a
-        ``.gcode`` extension so OctoPrint's file manager recognises it as
-        machinecode.
-        """
-        name = (display_name or "").strip()
-        if not name:
-            return "unknown_job.gcode"
-        base, ext = os.path.splitext(name)
-        # Replace characters that break SD file list parsing
-        base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
-        if not base:
-            base = "unknown_job"
-        # OctoPrint must recognise the extension as machinecode
-        if ext.lower() not in (".gcode", ".gco", ".g"):
-            ext = ".gcode"
-        return (base + ext).lower()
-
-    # Common slicer layer-change comment patterns (compiled once).
-    # Each pattern is its own bucket — we count hits per-pattern and
-    # return the max so that slicers emitting multiple marker types
-    # per layer (e.g. PrusaSlicer: ;LAYER_CHANGE + ;BEFORE_LAYER_CHANGE)
-    # aren't double-counted.
-    _LAYER_PATTERNS: tuple[re.Pattern[str], ...] = (
-        # Cura / ideaMaker: ;LAYER:0, ;LAYER:1, etc.
-        re.compile(r"^;\s*LAYER:\s*\d+", re.IGNORECASE),
-        # Simplify3D: ; layer 1, generated …
-        re.compile(r"^;\s*layer\s+\d+\b", re.IGNORECASE),
-        # PrusaSlicer: ;LAYER_CHANGE
-        re.compile(r"^;LAYER_CHANGE\b"),
-        # Slic3r: ;BEFORE_LAYER_CHANGE
-        re.compile(r"^;BEFORE_LAYER_CHANGE\b"),
-        # KISSlicer: ; BEGIN_LAYER_OBJECT
-        re.compile(r"^;\s*BEGIN_LAYER_OBJECT\b", re.IGNORECASE),
-    )
-
-    # Dremel 3D Slicer header: "; total layer number: 475"
-    _DREMEL_TOTAL_LAYER_RE: re.Pattern[str] = re.compile(
-        r"^;\s*total\s+layer\s+number:\s*(\d+)", re.IGNORECASE
-    )
-
-    # Number of header lines to scan for the Dremel total-layer hint.
-    _HEADER_SCAN_LINES: int = 50
-
-    @staticmethod
-    def _count_gcode_layers(file_path: str) -> int:
-        """Count total layer changes in a GCode file.
-
-        First scans the file header for a Dremel 3D Slicer
-        ``; total layer number: N`` hint and returns *N* immediately
-        if found.  Otherwise scans for common slicer layer-change
-        comments (Cura, PrusaSlicer, Simplify3D, ideaMaker, KISSlicer,
-        Slic3r).  Hits are counted **per-pattern** and the maximum is
-        returned so that slicers emitting multiple marker types per
-        layer are not double-counted.
-
-        The file is read line-by-line to keep memory usage low on
-        Raspberry Pi hosts.
-
-        Returns 0 if no layer markers are found or on any I/O error.
-        """
-        patterns = DremelVirtualSerial._LAYER_PATTERNS
-        counts = [0] * len(patterns)
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                for line_no, line in enumerate(f, 1):
-                    stripped = line.lstrip()
-                    if not stripped or stripped[0] != ";":
-                        continue
-                    # Fast header check for Dremel slicer total.
-                    if line_no <= DremelVirtualSerial._HEADER_SCAN_LINES:
-                        m = DremelVirtualSerial._DREMEL_TOTAL_LAYER_RE.match(stripped)
-                        if m:
-                            return int(m.group(1))
-                    for i, pat in enumerate(patterns):
-                        if pat.match(stripped):
-                            counts[i] += 1
-                            break
-        except Exception:
-            _LOGGER.debug("Failed to count layers in %s", file_path, exc_info=True)
-        return max(counts) if counts else 0
-
-    def _announce_sd_file(self, sd_name: str, file_size: int,
-                          display_name: str | None = None) -> None:
-        """Inject a file into OctoPrint's SD file list and announce it.
-
-        Sends ``Begin file list`` / entry / ``End file list`` so the file
-        appears in OctoPrint's in-memory SD cache, then sends
-        ``File opened:`` / ``File selected`` so the state panel shows it.
-
-        This is necessary because OctoPrint's frontend calls
-        ``/api/files/sdcard/<name>`` to load file metadata; if the file
-        is absent from the SD list, the API returns 404 and the "File"
-        field stays empty.
-        """
-        # Build the SD file list including our tracked uploads + this file
-        ts = self._to_fat_timestamp()
-        self._send("Begin file list")
-        for f in self._sd_files:
-            name = f.get("name", "unknown.gcode")
-            size = f.get("size", 0)
-            self._send(f"{name} {size}")
-        # Add the currently printing file (with timestamp + longname)
-        if display_name and display_name != sd_name:
-            self._send(f"{sd_name} {file_size} {ts} {display_name}")
-        else:
-            self._send(f"{sd_name} {file_size} {ts}")
-        self._send("End file list")
-
-        # Now announce the file selection
-        self._send(f"File opened: {sd_name} Size: {file_size}")
-        self._send("File selected")
 
     def _process_raw_line(self, raw_line: str) -> None:
         """Process a raw line as received over the virtual serial connection."""
@@ -843,9 +653,17 @@ class DremelVirtualSerial:
             self._send("ok")
             return
         
-        # Refresh printer info
-        _LOGGER.debug("Refreshing printer info for M115")
-        printer.set_printer_info(refresh=True)
+        # Refresh printer info only if cache is stale (static data).
+        now = time.time()
+        if now - self._printer_info_ts > self._PRINTER_INFO_TTL:
+            _LOGGER.debug("Refreshing printer info for M115 (cache stale)")
+            try:
+                printer.set_printer_info(refresh=True)
+                self._printer_info_ts = now
+            except Exception as e:
+                _LOGGER.debug("set_printer_info refresh failed (using cache): %s", e)
+        else:
+            _LOGGER.debug("Using cached printer info for M115")
         
         machine = printer.get_title() or "Dremel 3D45"
         firmware = printer.get_firmware_version() or "Unknown"
@@ -864,9 +682,7 @@ class DremelVirtualSerial:
             f" EXTRUDER_COUNT:1"
             f" UUID:{serial}"
         )
-        self._send("Cap:SDCARD:1")
         self._send("Cap:AUTOREPORT_TEMP:1")
-        self._send("Cap:AUTOREPORT_SD_STATUS:1")
         self._send("Cap:AUTOREPORT_POS:0")
         self._send("Cap:EEPROM:0")
         self._send("Cap:VOLUMETRIC:0")
@@ -874,7 +690,6 @@ class DremelVirtualSerial:
         self._send("Cap:CHAMBER_TEMPERATURE:1")
         self._send("Cap:BUILD_PERCENT:1")
         self._send("Cap:EMERGENCY_PARSER:0")
-        self._send("Cap:LFN_WRITE:0")
         self._send("ok")
 
     def _gcode_M114(self, command: str) -> None:
@@ -891,17 +706,8 @@ class DremelVirtualSerial:
         self._send("ok")
 
     def _gcode_M119(self, command: str) -> None:
-        """Report endstop status (simulated + door from Dremel API)."""
+        """Report endstop status (simulated + door from poll cache)."""
         door_status = "TRIGGERED" if self._door_open else "open"
-        
-        # Refresh door state from API
-        printer = self._printer
-        if printer:
-            try:
-                self._door_open = printer.is_door_open()
-                door_status = "TRIGGERED" if self._door_open else "open"
-            except Exception:
-                pass
 
         self._send("Reporting endstop status")
         self._send("x_min: open")
@@ -917,85 +723,7 @@ class DremelVirtualSerial:
         """Break out of a wait (no-op)."""
         self._send("ok")
 
-    def _gcode_M20(self, command: str) -> None:
-        """List SD card files."""
-        # NOTE: dremel3dpy determines there is no reliable way to list files on the 3D45 
-        # via the user-facing API. Therefore we rely on our session-scoped/persisted index 
-        # (self._sd_index) of files we have uploaded ourselves.
-        self._fetch_sd_files()
-        
-        _LOGGER.debug("M20: Listing %d files in SD index", len(self._sd_files))
-        
-        self._send("Begin file list")
-        for f in self._sd_files:
-            name = f.get("name", "unknown.gcode")
-            size = f.get("size", 0)
-            longname = f.get("longname", "")
-            if longname and longname != name:
-                ts = self._to_fat_timestamp()
-                self._send(f"{name} {size} {ts} {longname}")
-            else:
-                self._send(f"{name} {size}")
 
-        # Include the currently printing file so OctoPrint's frontend
-        # can look it up via the /api/files/sdcard/<name> endpoint.
-        if self._last_announced_sd_name:
-            already_listed = any(
-                f.get("name", "").lower() == self._last_announced_sd_name.lower()
-                for f in self._sd_files
-            )
-            if not already_listed:
-                file_size = int(self._selected_file_size or self._SYNTHETIC_FILE_SIZE)
-                display = self._selected_file_display or self._last_announced_sd_name
-                ts = self._to_fat_timestamp()
-                if display != self._last_announced_sd_name:
-                    self._send(
-                        f"{self._last_announced_sd_name} {file_size} {ts} {display}"
-                    )
-                else:
-                    self._send(f"{self._last_announced_sd_name} {file_size} {ts}")
-
-        self._send("End file list")
-        self._send("ok")
-
-    def _gcode_M23(self, command: str) -> None:
-        """Select SD file for printing. Format: M23 filename.gcode"""
-        if self._is_print_active():
-            _LOGGER.warning("M23: Cannot select file while printing")
-            self._send("Error: Cannot select file while printing")
-            self._send("ok")
-            return
-
-        parts = command.split(maxsplit=1)
-        if len(parts) < 2:
-            _LOGGER.warning("M23: No file specified")
-            self._send("Error: No file specified")
-            self._send("ok")
-            return
-
-        filename = parts[1].strip()
-        _LOGGER.debug("M23: Attempting to select file: %s", filename)
-        resolved = self._resolve_sd_filename(filename)
-        if not resolved:
-            _LOGGER.warning("M23: File not found in SD index: %s", filename)
-            self._send("Error: File not found")
-            self._send("ok")
-            return
-
-        display_name, remote_name, file_size = resolved
-        self._selected_file_display = display_name
-        self._selected_file_remote = remote_name
-        self._selected_file_size = int(file_size or 0)
-
-        _LOGGER.info(
-            "Selected file: %s (remote=%s, size=%d)",
-            display_name, remote_name, file_size,
-        )
-
-        sd_name = self._to_sd_filename(display_name)
-        self._send(f"File opened: {sd_name} Size: {file_size}")
-        self._send("File selected")
-        self._send("ok")
 
     def _gcode_M24(self, command: str) -> None:
         """Start/resume SD print."""
@@ -1035,7 +763,6 @@ class DremelVirtualSerial:
                 # Mark as announced so poll doesn't re-emit File opened.
                 self._was_printing = True
                 self._last_announced_job_name = self._selected_file_display
-                self._last_announced_sd_name = self._to_sd_filename(self._selected_file_display)
                 _LOGGER.info("Print started successfully")
                 self._send("ok")
             except Exception as e:
@@ -1078,22 +805,7 @@ class DremelVirtualSerial:
         self._gcode_M25(command)
 
     def _gcode_M27(self, command: str) -> None:
-        """Report SD print status (and optionally configure auto-report)."""
-        # Marlin: M27 S<sec> enables SD status auto-reporting
-        match = re.search(r"S(\d+)", command)
-        if match:
-            interval = int(match.group(1))
-            self._autosd_enabled = interval > 0
-            self._autosd_interval = interval
-            self._last_autosd_ts = 0.0
-            _LOGGER.debug(
-                "Auto-report SD status %s (interval=%ds)",
-                "enabled" if self._autosd_enabled else "disabled",
-                interval,
-            )
-            self._send("ok")
-            return
-
+        """Report SD print status."""
         if self._printing or self._paused:
             # Format: SD printing byte X/Y
             total = int(self._selected_file_size or self._SYNTHETIC_FILE_SIZE)
@@ -1103,13 +815,6 @@ class DremelVirtualSerial:
         else:
             _LOGGER.debug("SD status: not printing")
             self._send("Not SD printing")
-        self._send("ok")
-
-    def _gcode_M26(self, command: str) -> None:
-        """Set SD position (no-op).
-
-        Some senders issue M26 before M24; we don't support random access.
-        """
         self._send("ok")
 
     def _gcode_M524(self, command: str) -> None:
@@ -1137,7 +842,6 @@ class DremelVirtualSerial:
             self._last_job_phase = "idle"
             self._completion_sent = True  # Suppress redundant completion from poll
             self._last_announced_job_name = ""
-            self._last_announced_sd_name = ""
             self._progress_from_host = False
         _LOGGER.info("Print aborted - state reset")
         self._send("ok")
@@ -1397,7 +1101,6 @@ class DremelVirtualSerial:
             self._last_job_phase = "idle"
             self._completion_sent = True  # Suppress redundant completion from poll
             self._last_announced_job_name = ""
-            self._last_announced_sd_name = ""
             self._progress_from_host = False
         _LOGGER.info("Emergency stop executed - print state reset")
         self._send("ok")
@@ -1439,50 +1142,12 @@ class DremelVirtualSerial:
         self._send("ok")
 
     def _gcode_M21(self, command: str) -> None:
-        """Initialize SD card (Marlin: responds with SD card availability)."""
-        self._send("SD card ok")
+        """Initialize SD card (no-op — no SD card support)."""
         self._send("ok")
 
     def _gcode_M22(self, command: str) -> None:
         """Release SD card (no-op)."""
         self._send("ok")
-
-    def _gcode_M32(self, command: str) -> None:
-        """Select and start SD print. Format: M32 <filename>"""
-        if self._is_print_active():
-            _LOGGER.warning("M32: Cannot start new print while printing")
-            self._send("Error: Cannot start new print while printing")
-            self._send("ok")
-            return
-
-        parts = command.split(maxsplit=1)
-        if len(parts) < 2:
-            _LOGGER.warning("M32: No file specified")
-            self._send("Error: No file specified")
-            self._send("ok")
-            return
-
-        filename = parts[1].strip()
-        _LOGGER.debug("M32: Attempting to select and start: %s", filename)
-        resolved = self._resolve_sd_filename(filename)
-        if not resolved:
-            _LOGGER.warning("M32: File not found: %s", filename)
-            self._send("Error: File not found")
-            self._send("ok")
-            return
-
-        display_name, remote_name, file_size = resolved
-        self._selected_file_display = display_name
-        self._selected_file_remote = remote_name
-        self._selected_file_size = int(file_size or 0)
-
-        _LOGGER.info(
-            "M32: Selecting and starting print: %s (remote=%s)",
-            display_name, remote_name,
-        )
-
-        # Delegate to M24 which actually starts/resumes the print.
-        self._gcode_M24("M24")
 
     def _gcode_M73(self, command: str) -> None:
         """Set build progress (best-effort). Format: M73 P<percent> [R<min>]
@@ -1633,42 +1298,6 @@ class DremelVirtualSerial:
     # Dremel API Communication (via dremel3dpy library)
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _strip_gcode_ext(name: str) -> str:
-        """Strip .gcode / .g / .gco extension for comparison purposes.
-
-        The dremel3dpy library's ``get_job_name()`` strips file extensions,
-        but our SD index stores the remote filename WITH the extension
-        (e.g. ``"abcde.gcode"``).  This helper normalises both sides so
-        lookups succeed regardless of whether an extension is present.
-        """
-        if not name:
-            return ""
-        lower = name.lower()
-        for ext in (".gcode", ".gco", ".g"):
-            if lower.endswith(ext):
-                return name[: len(name) - len(ext)]
-        return name
-
-    def _lookup_sd_index_by_job_name(self, job_name: str) -> tuple[str, str, int, int] | None:
-        """Find an SD index entry matching *job_name* (extension-agnostic).
-
-        Returns ``(display_name, remote_name, size, total_layers)`` or ``None``.
-        """
-        if not job_name:
-            return None
-        stripped = self._strip_gcode_ext(job_name).lower()
-        for disp, meta in self._sd_index.items():
-            remote = meta.get("remote") or ""
-            if self._strip_gcode_ext(remote).lower() == stripped:
-                return (
-                    meta.get("display") or disp,
-                    remote,
-                    int(meta.get("size") or 0),
-                    int(meta.get("total_layers") or 0),
-                )
-        return None
-
     def _refresh_status(self) -> None:
         """Refresh printer status from Dremel API via library."""
         if self._closed:
@@ -1691,20 +1320,25 @@ class DremelVirtualSerial:
                 _LOGGER.debug("set_job_status failed: %s", e)
                 raise  # temperatures etc. depend on this; abort cycle
 
-            # Printer info changes rarely; refresh it periodically so
-            # firmware version / serial stay accurate.  Errors are non-
-            # fatal — cached data is used.
-            try:
-                printer.set_printer_info(refresh=True)
-            except Exception as e:
-                _LOGGER.debug("set_printer_info failed (non-fatal): %s", e)
+            # Printer info changes rarely; refresh it only when the TTL
+            # expires.  Errors are non-fatal — cached data is used.
+            now = time.time()
+            if now - self._printer_info_ts > self._PRINTER_INFO_TTL:
+                try:
+                    printer.set_printer_info(refresh=True)
+                    self._printer_info_ts = now
+                except Exception as e:
+                    _LOGGER.debug("set_printer_info failed (non-fatal): %s", e)
 
             # Extra status (max temps, storage) via HTTPS port 11134.
-            # Also non-fatal — cached or zero values are acceptable.
-            try:
-                printer.set_extra_status(refresh=True)
-            except Exception as e:
-                _LOGGER.debug("set_extra_status failed (non-fatal): %s", e)
+            # Also non-fatal and TTL-gated — cached or zero values are
+            # acceptable.
+            if now - self._extra_status_ts > self._EXTRA_STATUS_TTL:
+                try:
+                    printer.set_extra_status(refresh=True)
+                    self._extra_status_ts = now
+                except Exception as e:
+                    _LOGGER.debug("set_extra_status failed (non-fatal): %s", e)
 
             with self._lock:
                 # Get temperatures from API
@@ -1760,16 +1394,8 @@ class DremelVirtualSerial:
                     # Sync job name into selected file tracking
                     if job_name:
                         self._selected_file_remote = job_name
-                        # Check if this was one of our uploads
-                        match = self._lookup_sd_index_by_job_name(job_name)
-                        if match:
-                            display_name, _, file_size, total_layers = match
-                            self._selected_file_display = display_name
-                            self._selected_file_size = file_size
-                            self._total_layers = total_layers
-                        else:
+                        if not self._selected_file_display:
                             self._selected_file_display = job_name
-                            self._total_layers = 0
                     elif not self._selected_file_display:
                         self._selected_file_display = "unknown_job.gcode"
                         self._selected_file_remote = "unknown_job.gcode"
@@ -1778,16 +1404,13 @@ class DremelVirtualSerial:
                     if not self._selected_file_size:
                         self._selected_file_size = self._SYNTHETIC_FILE_SIZE
 
-                    # Tell OctoPrint a file is selected so it can enter
+                    # Tell OctoPrint a file is selected so it enters
                     # the SD printing state when it sees progress bytes.
-                    # We inject the file into the SD file list first so
-                    # OctoPrint's frontend can look it up via API.
                     file_display = self._selected_file_display or "unknown_job.gcode"
                     file_size = int(self._selected_file_size)
-                    sd_name = self._to_sd_filename(file_display)
-                    self._announce_sd_file(sd_name, file_size, file_display)
+                    self._send(f"File opened: {file_display} Size: {file_size}")
+                    self._send("File selected")
                     self._last_announced_job_name = file_display
-                    self._last_announced_sd_name = sd_name
 
                 # ----------------------------------------------------------
                 # Active → active: check for late job-name discovery
@@ -1806,23 +1429,15 @@ class DremelVirtualSerial:
                             job_name, self._last_announced_job_name,
                         )
                         self._selected_file_remote = job_name
-                        match = self._lookup_sd_index_by_job_name(job_name)
-                        if match:
-                            display_name, _, file_size, total_layers = match
-                            self._selected_file_display = display_name
-                            self._selected_file_size = file_size
-                            self._total_layers = total_layers
-                        else:
-                            self._selected_file_display = job_name
+                        self._selected_file_display = job_name
                         if not self._selected_file_size:
                             self._selected_file_size = self._SYNTHETIC_FILE_SIZE
 
                         file_display = self._selected_file_display
                         file_size = int(self._selected_file_size)
-                        sd_name = self._to_sd_filename(file_display)
-                        self._announce_sd_file(sd_name, file_size, file_display)
+                        self._send(f"File opened: {file_display} Size: {file_size}")
+                        self._send("File selected")
                         self._last_announced_job_name = file_display
-                        self._last_announced_sd_name = sd_name
 
                 # ----------------------------------------------------------
                 # Transition: active → terminal (completed / abort)
@@ -1837,7 +1452,6 @@ class DremelVirtualSerial:
                     self._selected_file_remote = ""
                     self._selected_file_size = 0
                     self._last_announced_job_name = ""
-                    self._last_announced_sd_name = ""
                     self._total_layers = 0
                     self._progress_from_host = False
                     self._completion_sent = True
@@ -1879,11 +1493,6 @@ class DremelVirtualSerial:
                 # Best-effort: keep selected file in sync with the active job name
                 if is_active and job_name:
                     self._selected_file_remote = job_name
-                    match = self._lookup_sd_index_by_job_name(job_name)
-                    if match:
-                        self._selected_file_display = match[0]
-                        self._selected_file_size = match[2]
-                        self._total_layers = match[3]
 
         except Exception as e:
             self._connection_errors += 1
@@ -1904,74 +1513,6 @@ class DremelVirtualSerial:
             else:
                 _LOGGER.debug("Error refreshing status: %s", e)
 
-    def _fetch_sd_files(self) -> None:
-        """Fetch file list from Dremel (if available)."""
-        # Dremel doesn't expose a reliable file listing via dremel3dpy.
-        # We therefore keep a session-scoped index of files uploaded via OctoPrint.
-        with self._lock:
-            self._sd_files = []
-            for meta in self._sd_index.values():
-                display_name = meta.get("display") or meta.get("remote") or "unknown.gcode"
-                sd_name = self._to_sd_filename(str(display_name))
-                self._sd_files.append(
-                    {
-                        "name": sd_name,
-                        "longname": str(display_name),
-                        "size": int(meta.get("size") or 0),
-                    }
-                )
-
-            # If we have a selected job that isn't in the index, still surface it for compatibility
-            if self._selected_file_remote:
-                selected_display = self._selected_file_display or self._selected_file_remote
-                selected_sd_name = self._to_sd_filename(selected_display)
-                if not any(
-                    f.get("name", "").lower() == selected_sd_name.lower()
-                    for f in self._sd_files
-                ):
-                    self._sd_files.append(
-                        {
-                            "name": selected_sd_name,
-                            "longname": selected_display,
-                            "size": int(self._selected_file_size or 0),
-                        }
-                    )
-
-    def _resolve_sd_filename(self, filename: str) -> Optional[tuple[str, str, int]]:
-        """Resolve an SD filename from display name to remote name.
-
-        Returns (display_name, remote_name, size) or None.
-        """
-        name = (filename or "").strip()
-        if not name:
-            return None
-
-        # Exact match on display name
-        for disp, meta in self._sd_index.items():
-            if disp.lower() == name.lower() or (meta.get("display") or "").lower() == name.lower():
-                return (meta.get("display") or disp, meta.get("remote") or disp, int(meta.get("size") or 0))
-
-        # Allow selecting by remote name if the host has it
-        for disp, meta in self._sd_index.items():
-            if (meta.get("remote") or "").lower() == name.lower():
-                return (meta.get("display") or disp, meta.get("remote") or name, int(meta.get("size") or 0))
-
-        # Allow selecting by SD-safe filename (e.g. name with spaces sanitised)
-        for disp, meta in self._sd_index.items():
-            candidate = meta.get("display") or disp
-            if self._to_sd_filename(str(candidate)).lower() == name.lower():
-                return (
-                    meta.get("display") or disp,
-                    meta.get("remote") or disp,
-                    int(meta.get("size") or 0),
-                )
-
-        # Fall back to whatever is currently selected (useful if firmware reports a job name)
-        if self._selected_file_remote and self._selected_file_remote.lower() == name.lower():
-            return (self._selected_file_display or name, self._selected_file_remote, int(self._selected_file_size or 0))
-
-        return None
-
     # -------------------------------------------------------------------------
     # Status Polling
     # -------------------------------------------------------------------------
@@ -1980,7 +1521,10 @@ class DremelVirtualSerial:
         """Background thread to poll printer status."""
         _LOGGER.info("Starting status polling thread")
 
-        while not self._poll_stop.wait(self._poll_interval):
+        while True:
+            interval = self._current_poll_interval()
+            if self._poll_stop.wait(interval):
+                break
             if self._closed:
                 break
             try:
@@ -2036,21 +1580,13 @@ class DremelVirtualSerial:
                                 f"//action:notification Layer {self._current_layer}"
                             )
 
-                elif self._autosd_enabled and self._autosd_interval > 0:
-                    # When idle, only send "Not SD printing" if auto-report
-                    # is enabled AND enough time has elapsed.
-                    if (now - self._last_autosd_ts) >= float(self._autosd_interval):
-                        if not self._was_printing:
-                            self._send("Not SD printing")
-                        self._last_autosd_ts = now
-
             except Exception as e:
                 _LOGGER.debug("Poll error: %s", e)
 
         _LOGGER.info("Status polling thread stopped")
 
     # -------------------------------------------------------------------------
-    # File Upload (for OctoPrint's upload to SD feature)
+    # File Upload
     # -------------------------------------------------------------------------
 
     def upload_file(self, local_path: str, remote_name: str) -> bool:
@@ -2098,58 +1634,14 @@ class DremelVirtualSerial:
 
             display_name = remote_name or uploaded_name
 
-            # Count total layers from GCode before the local file is removed
-            total_layers = self._count_gcode_layers(local_path)
-            if total_layers:
-                _LOGGER.info("Counted %d layers in %s", total_layers, local_path)
-
             with self._lock:
-                self._sd_index[display_name] = {
-                    "display": display_name,
-                    "remote": uploaded_name,
-                    "size": file_size,
-                    "total_layers": total_layers,
-                }
-                _LOGGER.debug(
-                    "Added to SD index: display=%s, remote=%s",
-                    display_name, uploaded_name,
-                )
-
-                # Store the uploaded name for later use
                 self._selected_file_display = display_name
                 self._selected_file_remote = uploaded_name
                 self._selected_file_size = file_size
 
-            self._save_sd_index()
             return True
             
         except Exception as e:
             _LOGGER.error("Upload failed: %s", e)
             _LOGGER.debug("Upload error details", exc_info=True)
             return False
-
-    # -------------------------------------------------------------------------
-    # SD index management helpers (used by plugin API/UI)
-    # -------------------------------------------------------------------------
-
-    def clear_sd_index(self) -> None:
-        """Clear the persisted SD index (best-effort)."""
-        _LOGGER.info("Clearing SD file index")
-        with self._lock:
-            count = len(self._sd_index)
-            self._sd_index = {}
-            self._sd_files = []
-            # Keep current selection intact; it's potentially the active job.
-        _LOGGER.debug("Cleared %d entries from SD index", count)
-        self._save_sd_index()
-
-    def get_sd_index_snapshot(self) -> dict:
-        """Return a snapshot of the SD index for UI display."""
-        with self._lock:
-            items = list(self._sd_index.values())
-        # Stable ordering for UI
-        items.sort(key=lambda x: (str(x.get("display") or "").lower()))
-        return {
-            "count": len(items),
-            "items": items,
-        }

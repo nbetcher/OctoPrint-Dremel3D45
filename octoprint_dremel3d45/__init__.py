@@ -13,6 +13,10 @@ Hooks used:
     - octoprint.comm.transport.serial.additional_port_names
     - octoprint.comm.protocol.gcode.queuing
     - octoprint.printer.estimation.remaining
+
+Note: The Dremel 3D45 has no real SD card support. Print progress is reported
+using Marlin-compatible ``SD printing byte X/Y`` messages so that OctoPrint's
+progress tracking works normally.
 """
 
 from __future__ import annotations
@@ -85,9 +89,10 @@ if _OCTOPRINT_AVAILABLE:
                     DREMEL_PORT_NAME,
                 )
                 _LOGGER.debug(
-                    "Settings: timeout=%ss, poll_interval=%ss, camera_enabled=%s",
+                    "Settings: timeout=%ss, poll_interval_printing=%ss, poll_interval_idle=%ss, camera_enabled=%s",
                     self._settings.get(["request_timeout"]),
-                    self._settings.get(["poll_interval"]),
+                    self._settings.get(["poll_interval_printing"]),
+                    self._settings.get(["poll_interval_idle"]),
                     self._settings.get_boolean(["camera_enabled"]),
                 )
             else:
@@ -144,7 +149,11 @@ if _OCTOPRINT_AVAILABLE:
             return {
                 "printer_ip": "",
                 "request_timeout": 30,
+                # Legacy single-interval setting retained for compatibility.
                 "poll_interval": 10,
+                # Adaptive polling: faster while printing, slower while idle.
+                "poll_interval_printing": 5,
+                "poll_interval_idle": 15,
                 "camera_enabled": False,
                 "camera_update_global": False,
                 "camera_stream_url": "",
@@ -157,6 +166,8 @@ if _OCTOPRINT_AVAILABLE:
                     ["printer_ip"],
                     ["request_timeout"],
                     ["poll_interval"],
+                    ["poll_interval_printing"],
+                    ["poll_interval_idle"],
                     ["camera_enabled"],
                     ["camera_update_global"],
                     ["camera_stream_url"],
@@ -185,9 +196,10 @@ if _OCTOPRINT_AVAILABLE:
                         _LOGGER.warning("Error closing virtual serial on IP change: %s", e)
                     self._virtual_serial = None
             _LOGGER.debug(
-                "Settings after save: timeout=%ss, poll_interval=%ss",
+                "Settings after save: timeout=%ss, poll_interval_printing=%ss, poll_interval_idle=%ss",
                 self._settings.get(["request_timeout"]),
-                self._settings.get(["poll_interval"]),
+                self._settings.get(["poll_interval_printing"]),
+                self._settings.get(["poll_interval_idle"]),
             )
 
             # Propagate mutable settings to the running virtual serial session
@@ -269,13 +281,35 @@ if _OCTOPRINT_AVAILABLE:
                 _c.REQUEST_TIMEOUT = timeout
                 _dremel3dpy.REQUEST_TIMEOUT = timeout
 
-                printer = Dremel3DPrinter(printer_ip)
-                printer.set_printer_info(refresh=True)
+                # Prefer a healthy active session to avoid a redundant probe.
+                printer = None
+                source = "fresh-probe"
+                vs = self._virtual_serial
+                if (
+                    vs
+                    and not getattr(vs, "_closed", True)
+                    and getattr(vs, "_host", "") == printer_ip
+                    and getattr(vs, "_connected", False)
+                    and getattr(vs, "_connection_errors", 0) == 0
+                    and getattr(vs, "_printer", None) is not None
+                ):
+                    printer = vs._printer
+                    source = "live-session"
+
+                if printer is None:
+                    printer = Dremel3DPrinter(printer_ip)
+                    printer.set_printer_info(refresh=True)
+
                 fw = printer.get_firmware_version() or "Unknown"
                 model = printer.get_title() or "Unknown"
                 sn = printer.get_serial_number() or "Unknown"
-                _LOGGER.info("Connection test succeeded: %s (fw=%s)", model, fw)
-                return jsonify(ok=True, firmware=fw, model=model, serial=sn)
+                _LOGGER.info(
+                    "Connection test succeeded (%s): %s (fw=%s)",
+                    source,
+                    model,
+                    fw,
+                )
+                return jsonify(ok=True, firmware=fw, model=model, serial=sn, source=source)
             except Exception as e:
                 _LOGGER.warning("Connection test failed: %s", e)
                 return jsonify(ok=False, error=str(e))
@@ -317,7 +351,6 @@ if _OCTOPRINT_AVAILABLE:
 
         def get_api_commands(self) -> dict:
             return {
-                "clear_sd_index": [],
                 "test_connection": [],
             }
 
@@ -325,48 +358,6 @@ if _OCTOPRINT_AVAILABLE:
             """Return plugin status information for the settings UI."""
             _LOGGER.debug("API GET request received")
             from flask import jsonify
-
-            sd_index = {"count": 0, "items": []}
-            sd_index_path = None
-
-            try:
-                sd_index_path = self.get_plugin_data_folder()
-            except Exception:
-                sd_index_path = None
-
-            index_file = None
-            if sd_index_path:
-                try:
-                    import os
-
-                    index_file = os.path.join(sd_index_path, "sd_index.json")
-                except Exception:
-                    index_file = None
-
-            if self._virtual_serial:
-                try:
-                    sd_index = self._virtual_serial.get_sd_index_snapshot()
-                except Exception:
-                    sd_index = {"count": 0, "items": []}
-            elif index_file:
-                # Best-effort load from disk when not connected
-                try:
-                    import json
-                    import os
-
-                    if os.path.exists(index_file):
-                        with open(index_file, "r", encoding="utf-8") as f:
-                            payload = json.load(f)
-                        items = payload.get("items", {})
-                        if isinstance(items, dict):
-                            cleaned = []
-                            for _, meta in items.items():
-                                if isinstance(meta, dict):
-                                    cleaned.append(meta)
-                            cleaned.sort(key=lambda x: str(x.get("display") or "").lower())
-                            sd_index = {"count": len(cleaned), "items": cleaned}
-                except Exception:
-                    sd_index = {"count": 0, "items": []}
 
             connected = False
             if self._virtual_serial:
@@ -377,7 +368,6 @@ if _OCTOPRINT_AVAILABLE:
 
             return jsonify(
                 connected=connected,
-                sd_index=sd_index,
             )
 
         def on_api_command(self, command: str, data):  # noqa: ANN001
@@ -386,35 +376,7 @@ if _OCTOPRINT_AVAILABLE:
             if command == "test_connection":
                 return self._handle_test_connection()
 
-            if command != "clear_sd_index":
-                _LOGGER.debug("Unknown API command: %s", command)
-                return
-
-            from flask import jsonify
-
-            _LOGGER.info("Clearing SD file index")
-
-            # Clear in-memory (if connected) and on-disk mapping
-            if self._virtual_serial:
-                try:
-                    self._virtual_serial.clear_sd_index()
-                    _LOGGER.debug("Cleared in-memory SD index")
-                except Exception as e:
-                    _LOGGER.warning("Failed to clear in-memory SD index: %s", e)
-
-            try:
-                import os
-
-                data_folder = self.get_plugin_data_folder()
-                index_file = os.path.join(data_folder, "sd_index.json")
-                if os.path.exists(index_file):
-                    os.remove(index_file)
-                    _LOGGER.debug("Removed SD index file: %s", index_file)
-            except Exception as e:
-                _LOGGER.warning("Failed to remove SD index file: %s", e)
-
-            _LOGGER.info("SD file index cleared successfully")
-            return jsonify(ok=True)
+            _LOGGER.debug("Unknown API command: %s", command)
 
         # -------------------------------------------------------------------------
         # Print Time Estimation Hook
@@ -496,16 +458,9 @@ if _OCTOPRINT_AVAILABLE:
 
             from .virtual_serial import DremelVirtualSerial
 
-            data_folder = None
-            try:
-                data_folder = self.get_plugin_data_folder()
-            except Exception:
-                data_folder = None
-
             self._virtual_serial = DremelVirtualSerial(
                 settings=self._settings,
                 read_timeout=float(read_timeout),
-                data_folder=data_folder,
             )
 
             _LOGGER.info("Virtual serial connection created successfully")
@@ -637,7 +592,7 @@ if _OCTOPRINT_AVAILABLE:
                 # Notify the frontend that upload is beginning
                 self._notify_redirect("uploading", file_name)
 
-                # Upload via the existing SD upload machinery
+                # Upload via the virtual serial upload helper
                 if not vs.upload_file(file_path, file_name):
                     _LOGGER.error("Dremel upload failed for %s", file_name)
                     self._notify_redirect("error", file_name, "Upload failed")
@@ -669,9 +624,6 @@ if _OCTOPRINT_AVAILABLE:
                 with vs._lock:
                     vs._was_printing = True
                     vs._last_announced_job_name = display_name
-                    vs._last_announced_sd_name = vs._to_sd_filename(
-                        display_name
-                    )
 
                 _LOGGER.info(
                     "Local print redirected to Dremel successfully: %s",
@@ -705,63 +657,7 @@ if _OCTOPRINT_AVAILABLE:
             except Exception:
                 pass
 
-        # -------------------------------------------------------------------------
-        # SD Card Upload Hook
-        # -------------------------------------------------------------------------
 
-        def sdcard_upload_hook(
-            self,
-            printer,
-            filename: str,
-            path: str,
-            sd_upload_started,
-            sd_upload_succeeded,
-            sd_upload_failed,
-            *args,
-            **kwargs,
-        ):
-            """
-            Hook: octoprint.printer.sdcardupload
-
-            Called when OctoPrint wants to upload a file to the printer's SD card.
-            We intercept this and upload via the Dremel REST API.
-            """
-            if not self._virtual_serial:
-                _LOGGER.error("SD upload failed: not connected to Dremel printer")
-                sd_upload_failed(
-                    filename, path, "Not connected to Dremel printer"
-                )
-                return
-
-            try:
-                if not bool(self._virtual_serial.is_open):
-                    _LOGGER.error("SD upload failed: virtual serial session is closed")
-                    sd_upload_failed(
-                        filename, path, "Not connected to Dremel printer"
-                    )
-                    return
-            except Exception:
-                _LOGGER.error("SD upload failed: virtual serial session state unavailable")
-                sd_upload_failed(
-                    filename, path, "Not connected to Dremel printer"
-                )
-                return
-
-            _LOGGER.info("Starting SD upload: %s -> %s", path, filename)
-            _LOGGER.debug("Upload source path: %s", path)
-            sd_upload_started(filename, path)
-
-            try:
-                success = self._virtual_serial.upload_file(path, filename)
-                if success:
-                    _LOGGER.info("SD upload succeeded: %s", filename)
-                    sd_upload_succeeded(filename, path)
-                else:
-                    _LOGGER.error("SD upload failed (no exception): %s", filename)
-                    sd_upload_failed(filename, path, "Upload failed")
-            except Exception as e:
-                _LOGGER.exception("SD upload error for %s: %s", filename, e)
-                sd_upload_failed(filename, path, str(e))
 
 
 # -----------------------------------------------------------------------------
@@ -787,8 +683,6 @@ def __plugin_load__():
             1,  # Priority: run before default serial factory
         ),
         "octoprint.comm.transport.serial.additional_port_names": plugin.get_additional_port_names,
-        # SD card upload hook
-        "octoprint.printer.sdcardupload": plugin.sdcard_upload_hook,
         # GCode queuing hook — intercept local file prints
         "octoprint.comm.protocol.gcode.queuing": plugin.gcode_queuing_hook,
         # Print time estimation from Dremel API
